@@ -1,0 +1,125 @@
+import praw
+import requests
+import time
+from PIL import Image
+import imagehash
+from keep_alive import keep_alive
+
+
+# Connect to Reddit
+reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
+                         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
+                         username='PokeLeakBot3',
+                         password='testbot1',
+                         user_agent='testbot')
+
+# Create a set to store the processed submission IDs
+processed_submission_ids = set()
+
+# Create a dictionary to store the image hashes and their corresponding submission IDs
+image_hashes = {}
+
+# Set the subreddit you want the bot to run on
+subreddit = reddit.subreddit('PokeLeaks')
+
+# Get the current timestamp
+current_time = int(time.time())
+
+keep_alive()
+while True:
+    # Iterate through all submissions in the subreddit
+    for submission in subreddit.new(limit=99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999):
+        # Check if the submission ID has already been processed
+        if submission.id in processed_submission_ids:
+            # If the submission ID has already been processed, skip it
+            continue
+
+        print("Scanning image/post: ", submission.url)
+        # Check if the submission is an image
+        if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+            # Get the image data
+            image_data = requests.get(submission.url).content
+            
+            # Open the image and calculate the pHash
+            img = Image.open(requests.get(submission.url, stream=True).raw)
+            phash = str(imagehash.phash(img))
+
+            # Open the image and calculate the wHash
+            img = Image.open(requests.get(submission.url, stream=True).raw)
+            whash = str(imagehash.whash(img))
+
+            # Open the image and calculate the colorhash
+            img = Image.open(requests.get(submission.url, stream=True).raw)
+            colorhash = str(imagehash.colorhash(img))
+
+            # Open the image and calculate the averagehash
+            img = Image.open(requests.get(submission.url, stream=True).raw)
+            ahash = str(imagehash.average_hash(img))
+                
+            # Check if the pHash is already in the dictionary
+            if phash in image_hashes:
+                # If the pHash is already in the dictionary, it's a near-duplicate
+                # Get the original submission ID
+                original_submission_id, original_time = image_hashes[phash]
+
+                # Check if the current submission is not the original submission
+                if submission.id != original_submission_id:
+                    if submission.created_utc > original_time:
+                    #Remove the duplicate submission
+                        submission.mod.remove()
+                        print("Duplicate removed: ", submission.url)
+            else:
+                # If the pHash is not in the dictionary, add it with the submission ID
+                image_hashes[phash] = (submission.id, submission.created_utc)
+
+
+            # Check if the wHash is already in the dictionary
+            if whash in image_hashes:
+                # If the wHash is already in the dictionary, it's a near-duplicate
+                # Get the original submission ID
+                original_submission_id, original_time = image_hashes[whash]
+
+                # Check if the current submission is not the original submission
+                if submission.id != original_submission_id:
+                    if submission.created_utc > original_time:
+                    #Remove the duplicate submission
+                        submission.mod.remove()
+                        print("Duplicate removed: ", submission.url)
+            else:
+                # If the wHash is not in the dictionary, add it with the submission ID
+                image_hashes[whash] = (submission.id, submission.created_utc)
+
+            # Check if the ColorHash is already in the dictionary
+            if colorhash in image_hashes:
+                # If the ColorHash is already in the dictionary, it's a near-duplicate
+                # Get the original submission ID
+                original_submission_id, original_time = image_hashes[colorhash]
+
+                # Check if the current submission is not the original submission
+                if submission.id != original_submission_id:
+                    if submission.created_utc > original_time:
+                    #Remove the duplicate submission
+                        submission.mod.remove()
+                        print("Duplicate removed: ", submission.url)
+            else:
+                # If the colorhash is not in the dictionary, add it with the submission ID
+                image_hashes[colorhash] = (submission.id, submission.created_utc)
+
+
+            # Check if the aHash is already in the dictionary
+            if ahash in image_hashes:
+                # If the aHash is already in the dictionary, it's a near-duplicate
+                # Get the original submission ID
+                original_submission_id, original_time = image_hashes[ahash]
+
+                # Check if the current submission is not the original submission
+                if submission.id != original_submission_id:
+                    if submission.created_utc > original_time:
+                    #Remove the duplicate submission
+                        submission.mod.remove()
+                        print("Duplicate removed: ", submission.url)
+            else:
+                # If the aHash is not in the dictionary, add it with the submission ID
+                image_hashes[ahash] = (submission.id, submission.created_utc)
+        # Add the submission ID to the set of processed submission IDs
+        processed_submission_ids.add(submission.id)
