@@ -1,0 +1,26 @@
+import praw
+import time
+from keep_alive import keep_alive
+
+reddit = praw.Reddit(client_id='',
+                         client_secret='',
+                         username=',
+                         password='',
+                         user_agent='')
+
+subreddit = reddit.subreddit('PokeLeaks')
+
+previous_spoiler_status = {}
+
+keep_alive()
+while True:
+    for submission in subreddit.new():
+        if submission.id not in previous_spoiler_status:
+            previous_spoiler_status[submission.id] = submission.spoiler
+            continue
+        if previous_spoiler_status[submission.id] != submission.spoiler:
+            if not submission.spoiler:
+                print(f'Post {submission.id} has been unmarked as a spoiler. Remarking as spoiler again.')
+                submission.mod.spoiler()
+            previous_spoiler_status[submission.id] = submission.spoiler
+    time.sleep(10)
