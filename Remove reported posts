@@ -1,0 +1,29 @@
+import praw
+import time
+from keep_alive import keep_alive
+
+# Set up the Reddit API connection
+reddit = praw.Reddit(client_id='',
+                     client_secret='',
+                     username='',
+                     password='',
+                     user_agent=')
+
+# Set up a dictionary of removal reasons to their report threshold
+thresholds = {'Posts must be about leaks, riddles, news, and rumours about Pokémon content': 2, 'Post must not contain any profanities, vulgarity, sexual content, slurs, be appropriate in nature': 2, 'No reposting of posts already up on the subreddit': 1, 'No memes allowed': 2, 'No joke submissions or shitposts': 2, 'No Self Advertisements/Promotion': 2, 'No Fan art': 2, 'Theories, Questions, Speculations must be commented in the Theory/Speculation/Question Megathread': 2, 'Posts with spoilers must have required spoiler flair, indicate spoiler alert in title, and be vague': 3, 'Retarded': 1}
+
+keep_alive()
+while True:
+    # Check the mod queue for new activities
+    for item in reddit.subreddit('Pokeleaks').mod.modqueue(limit=100):
+        # Check if the item has any user reports
+        if item.user_reports:
+            # Check if the report reason is in the threshold dict
+            if item.user_reports[0][0] in thresholds:
+                # Check if the number of reports for that reason exceed the threshold
+                if item.user_reports[0][1] >= thresholds[item.user_reports[0][0]]:
+                    # Remove the submission
+                    item.mod.remove()
+                    print(f'Submission "{item.title}" removed due to {item.user_reports[0][1]} reports for reason: {item.user_reports[0][0]}')
+    # Wait for 10 seconds before checking again
+    time.sleep(10)
