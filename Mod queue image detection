@@ -1,0 +1,117 @@
+import praw
+import requests
+import time
+from PIL import Image
+import imagehash
+from keep_alive import keep_alive
+
+# Connect to Reddit
+reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
+                         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
+                         username='PokeLeakBot3',
+                         password='testbot1',
+                         user_agent='testbot')
+
+# Set the subreddit you want the bot to run on
+subreddit = reddit.subreddit('PokeLeaks')
+
+# Create a dictionary to store the image hashes, their corresponding submission IDs, and the time of the post
+image_hashes = {}
+
+
+# Get the current timestamp
+current_time = int(time.time())
+
+# Scan all previous submissions
+for submission in subreddit.new(limit=1000000000):
+    print("Scanning image/post: ", submission.url)
+    if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+        try:
+            image_data = requests.get(submission.url).content
+            img = Image.open(requests.get(submission.url, stream=True).raw)
+            image_hash = str(imagehash.phash(img))
+            if image_hash in image_hashes:
+                original_submission_id, original_time = image_hashes[image_hash]
+                if submission.id != original_submission_id:
+                    if submission.created_utc > original_time:
+                        submission.mod.remove()
+
+                        print("Duplicate removed: ", submission.url)
+                    else:
+                        image_hashes[image_hash] = (submission.id, submission.created_utc)
+            else:
+                image_hashes[image_hash] = (submission.id, submission.created_utc)
+        except Exception as e:
+            print(e)
+            continue
+
+# Keep the script running to check for new submissions
+keep_alive()
+while True:
+    for submission in subreddit.new():
+        # Check if the submission is a new one
+        if submission.created_utc > current_time:
+            print("Scanning new image/post: ", submission.url)
+            if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                try:
+                    image_data = requests.get(submission.url).content
+                    img = Image.open(requests.get(submission.url, stream=True).raw)
+                    image_hash = str(imagehash.phash(img))
+                    if image_hash in image_hashes:
+                        original_submission_id, original_time = image_hashes[image_hash]
+                        if submission.id != original_submission_id:
+                            if submission.created_utc > original_time:
+                                # Remove the duplicate submission
+                                submission.mod.remove()
+                                print("Duplicate removed: ", submission.url)
+                        else:
+                            # Update the dictionary with the new submission ID and time
+                            image_hashes[image_hash] = (submission.id, submission.created_utc)
+                    else:
+                        # If the image hash is not in the dictionary, add it with the submission ID and time
+                        image_hashes[image_hash] = (submission.id, submission.created_utc)
+                except Exception as e:
+                    print(e)
+                    continue
+            current_time = int(time.time())
+
+            
+
+    # Iterate through the submissions in the modqueue
+    for submission in subreddit.mod.modqueue():
+        print("Scanning Mod Queue: ", submission.url)
+        # Check if the submission is an image
+        if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+            # Get the image data
+            image_data = requests.get(submission.url).content
+
+            # Open the image and calculate the dHash
+            img = Image.open(requests.get(submission.url, stream=True).raw)
+            image_hash = str(imagehash.phash(img))
+
+            # Check if the image hash is already in the dictionary
+            if image_hash in image_hashes:
+                # If the image hash is already in the dictionary, it's a duplicate
+                # Get the original submission ID and time of the post
+                original_submission_id, original_time = image_hashes[image_hash]
+                # Check if the current submission is not the original submission
+                if submission.id != original_submission_id:
+                    # Compare the time of the original post with the time of the new post
+                    if submission.created_utc > original_time:
+                        # Approve the original submission
+                        reddit.submission(original_submission_id).mod.approve()
+                        # Remove the duplicate submission
+                        submission.mod.remove()
+                        comment = submission.reply("This submission is a duplicate of [this original submission](https://www.reddit.com/r/{}/comments/{}/)".format(subreddit, original_submission_id))
+                        comment.mod.distinguish(sticky=True,)
+                        print("Duplicate removed: ", submission.url)
+                    else:
+                        # Update the dictionary with the new submission ID and time
+                        image_hashes[image_hash] = (submission.id, submission.created_utc)
+                else:
+                    # If the current submission is the original submission, approve it
+                    submission.mod.approve()
+                    print("Original submission approved: ", submission.url)
+            else:
+                # If the image hash is not in the dictionary, add it with the submission ID and time
+                image_hashes[image_hash] = (submission.id, submission.created_utc)
