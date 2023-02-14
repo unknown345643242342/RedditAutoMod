@@ -1,0 +1,22 @@
+import praw
+import time
+from keep_alive import keep_alive
+
+def monitor_reported_posts():
+    reddit = praw.Reddit(client_id='',
+                         client_secret='',
+                         username='',
+                         password='',
+                         user_agent='')
+
+
+    subreddit = reddit.subreddit("PokeLeaks")
+    for post in subreddit.mod.reports():
+        if post.approved:
+            post.mod.approve()
+            print(f"Post {post.id} has been approved again")
+          
+
+keep_alive()
+while True:
+    monitor_reported_posts()
