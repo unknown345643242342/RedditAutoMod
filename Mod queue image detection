@@ -4,6 +4,8 @@ import time
 from PIL import Image
 import imagehash
 from keep_alive import keep_alive
+from datetime import datetime
+
 
 # Connect to Reddit
 reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
@@ -13,7 +15,7 @@ reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
                          user_agent='testbot')
 
 # Set the subreddit you want the bot to run on
-subreddit = reddit.subreddit('PokeLeaks')
+subreddit = reddit.subreddit('tittyfucker')
 
 # Create a dictionary to store the image hashes, their corresponding submission IDs, and the time of the post
 image_hashes = {}
@@ -94,15 +96,26 @@ while True:
                 # If the image hash is already in the dictionary, it's a duplicate
                 # Get the original submission ID and time of the post
                 original_submission_id, original_time = image_hashes[image_hash]
+                original_submission = reddit.submission(id=original_submission_id)
+                original_post_link = f"https://www.reddit.com{original_submission.permalink}"
+                original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+                original_post_title = original_submission.title
+                original_post_author = original_submission.author
                 # Check if the current submission is not the original submission
                 if submission.id != original_submission_id:
                     # Compare the time of the original post with the time of the new post
                     if submission.created_utc > original_time:
-                        # Approve the original submission
-                        reddit.submission(original_submission_id).mod.approve()
                         # Remove the duplicate submission
                         submission.mod.remove()
-                        comment = submission.reply("This submission is a duplicate of [this original submission](https://www.reddit.com/r/{}/comments/{}/)".format(subreddit, original_submission_id))
+                        comment = submission.reply(
+            "> **Duplicate of the following post by u/{}:**\n\n"
+            ">| Title | Date and Time |\n"
+            ">|:---:|:---:|\n"
+            ">| [{}]({}) | {} |\n\n"
+            ">[Link to Original Post]({})"
+            .format(original_post_author, original_post_title, original_post_link, original_post_date, original_post_link)
+        )
+
                         comment.mod.distinguish(sticky=True,)
                         print("Duplicate removed: ", submission.url)
                     else:
