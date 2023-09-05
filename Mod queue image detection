@@ -9,11 +9,11 @@ import imagehash
 import cv2
 
 # Connect to Reddit
-reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
-                     client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-                     username='PokeLeakBot3',
-                     password='testbot1',
-                     user_agent='testbot')
+reddit = praw.Reddit(client_id='',
+                     client_secret='',
+                     username='',
+                     password='',
+                     user_agent='')
 
 # Set the subreddit you want the bot to run on
 subreddit = reddit.subreddit('Pokeleaks')
