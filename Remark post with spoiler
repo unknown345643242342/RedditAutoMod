@@ -1,26 +1,40 @@
 import praw
+import prawcore  # Import prawcore library for error handling
 import time
-from keep_alive import keep_alive
 
-reddit = praw.Reddit(client_id='',
-                         client_secret='',
-                         username=',
-                         password='',
-                         user_agent='')
+# Function to handle exceptions without waiting
+def handle_exception(e):
+    if isinstance(e, prawcore.exceptions.ResponseException) and e.response.status_code == 429:
+        print("Rate limited by Reddit API. Ignoring error.")
+    else:
+        print(f"Exception encountered: {str(e)}")
 
-subreddit = reddit.subreddit('PokeLeaks')
+try:
+    reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
+                         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
+                         username='PokeLeakBot3',
+                         password='testbot1',
+                         user_agent='testbot')
 
-previous_spoiler_status = {}
+    subreddit = reddit.subreddit('PokeLeaks')
 
-keep_alive()
-while True:
-    for submission in subreddit.new():
-        if submission.id not in previous_spoiler_status:
-            previous_spoiler_status[submission.id] = submission.spoiler
-            continue
-        if previous_spoiler_status[submission.id] != submission.spoiler:
-            if not submission.spoiler:
-                print(f'Post {submission.id} has been unmarked as a spoiler. Remarking as spoiler again.')
-                submission.mod.spoiler()
-            previous_spoiler_status[submission.id] = submission.spoiler
-    time.sleep(10)
+    previous_spoiler_status = {}
+
+    while True:
+        for submission in subreddit.new():
+            if submission.id not in previous_spoiler_status:
+                previous_spoiler_status[submission.id] = submission.spoiler
+                continue
+            if previous_spoiler_status[submission.id] != submission.spoiler:
+                if not submission.spoiler:
+                    try:
+                        print(f'Post {submission.id} has been unmarked as a spoiler. Remarking as spoiler again.')
+                        submission.mod.spoiler()
+                    except prawcore.exceptions.ServerError as e:
+                        handle_exception(e)
+                previous_spoiler_status[submission.id] = submission.spoiler
+
+except Exception as e:
+    handle_exception(e)
+
+
