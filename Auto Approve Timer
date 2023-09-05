@@ -9,11 +9,11 @@ def handle_exception(e):
     else:
         print(f"Exception encountered: {str(e)}")
 
-reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
-                     client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-                     username='PokeLeakBot3',
-                     password='testbot1',
-                     user_agent='testbot') 
+reddit = praw.Reddit(client_id='',
+                     client_secret='',
+                     username='',
+                     password='',
+                     user_agent='') 
 
 timers = {}  # Create an empty dictionary to store the start time for each reported item
 
