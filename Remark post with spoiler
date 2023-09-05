@@ -10,13 +10,13 @@ def handle_exception(e):
         print(f"Exception encountered: {str(e)}")
 
 try:
-    reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
-                         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-                         username='PokeLeakBot3',
-                         password='testbot1',
-                         user_agent='testbot')
+    reddit = praw.Reddit(client_id='',
+                         client_secret='',
+                         username='',
+                         password='',
+                         user_agent='')
 
-    subreddit = reddit.subreddit('PokeLeaks')
+    subreddit = reddit.subreddit('')
 
     previous_spoiler_status = {}
 
