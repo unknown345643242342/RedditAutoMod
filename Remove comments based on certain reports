@@ -1,30 +1,41 @@
 import praw
+import prawcore  # Import prawcore library for error handling
 import time
-from keep_alive import keep_alive
 
-# Set up the Reddit API connection
-reddit = praw.Reddit(client_id='',
-                     client_secret='',
-                     username='',
-                     password='',
-                     user_agent='')
+# Function to handle exceptions without waiting
+def handle_exception(e):
+    if isinstance(e, prawcore.exceptions.ResponseException) and e.response.status_code == 429:
+        print("Rate limited by Reddit API. Ignoring error.")
+    else:
+        print(f"Exception encountered: {str(e)}")
 
-# Set up a dictionary of removal reasons to their report threshold
-thresholds = {'Comments complaining about Riddler Khu will be removed. Ignore the post if you are going to complain': 1, 'No insults or harassment of other subreddit members in the comments': 1, 'No asking about or sharing of XCI or NSP files': 1, 'This is spam': 1}
+try:
+    # Set up the Reddit API connection
+    reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
+                         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
+                         username='PokeLeakBot3',
+                         password='testbot1',
+                         user_agent='testbot')
 
-keep_alive()
-while True:
-    # Check the mod queue for new activities
-    for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
-        # Check if the item has any user reports
-        if comment.user_reports:
-            # Check if the report reason is in the threshold dict
-            if comment.user_reports[0][0] in thresholds:
-                # Check if the number of reports for that reason exceed the threshold
-                if comment.user_reports[0][1] >= thresholds[comment.user_reports[0][0]]:
-                    # Remove the comment
-                    comment.mod.remove()
-                    print(f'Comment "{comment.body}" removed due to {comment.user_reports[0][1]} reports for reason: {comment.user_reports[0][0]}')
-    # Wait for 10 seconds before checking again
-    time.sleep(10)
+    # Set up a dictionary of removal reasons to their report threshold
+    thresholds = {'Comments complaining about Riddler Khu will be removed. Ignore the post if you are going to complain': 1, 'No insults or harassment of other subreddit members in the comments': 1, 'No asking about or sharing of XCI or NSP files': 1}
+
+    while True:
+        # Check the mod queue for new activities
+        for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+            # Check if the item is a comment and has any user reports
+            if isinstance(comment, praw.models.Comment) and comment.user_reports:
+                # Check if the report reason is in the threshold dict
+                if comment.user_reports[0][0] in thresholds:
+                    # Check if the number of reports for that reason exceeds the threshold
+                    if comment.user_reports[0][1] >= thresholds[comment.user_reports[0][0]]:
+                        # Remove the comment
+                        try:
+                            comment.mod.remove()
+                            print(f'Comment "{comment.body}" removed due to {comment.user_reports[0][1]} reports for reason: {comment.user_reports[0][0]}')
+                        except prawcore.exceptions.ServerError as e:
+                            handle_exception(e)
+
+except Exception as e:
+    handle_exception(e)
 
