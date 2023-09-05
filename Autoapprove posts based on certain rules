@@ -1,29 +1,41 @@
 import praw
+import prawcore  # Import prawcore library for error handling
 import time
-from keep_alive import keep_alive
 
-# Set up the Reddit API connection
-reddit = praw.Reddit(client_id='',
-                     client_secret='',
-                     username='',
-                     password='',
-                     user_agent='')
+# Function to handle exceptions without waiting
+def handle_exception(e):
+    if isinstance(e, prawcore.exceptions.ResponseException) and e.response.status_code == 429:
+        print("Rate limited by Reddit API. Ignoring error.")
+    else:
+        print(f"Exception encountered: {str(e)}")
 
-# Set up a dictionary of removal reasons to their report threshold
-thresholds = {'This is misinformation': 1, 'This is spam': 1}
+try:
+    # Set up the Reddit API connection
+    reddit = praw.Reddit(client_id='',
+                         client_secret='',
+                         username='',
+                         password='',
+                         user_agent='')
 
-keep_alive()
-while True:
-    # Check the mod queue for new activities
-    for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
-        # Check if the item has any user reports
-        if post.user_reports:
-            # Check if the report reason is in the threshold dict
-            if post.user_reports[0][0] in thresholds:
-                # Check if the number of reports for that reason exceed the threshold
-                if post.user_reports[0][1] >= thresholds[post.user_reports[0][0]]:
-                    # approve the submission
-                    post.mod.approve()
-                    print(f'post "{post.title}" approved due to {post.user_reports[0][1]} reports for reason: {post.user_reports[0][0]}')
-    # Wait for 10 seconds before checking again
-    time.sleep(10)
+    # Set up a dictionary of removal reasons to their report threshold
+    thresholds = {'This is misinformation': 1, 'This is spam': 1}
+
+    while True:
+        # Check the mod queue for new activities
+        for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+            # Check if the item is a post and has any user reports
+            if isinstance(post, praw.models.Submission) and post.user_reports:
+                # Check if the report reason is in the threshold dict
+                if post.user_reports[0][0] in thresholds:
+                    # Check if the number of reports for that reason exceeds the threshold
+                    if post.user_reports[0][1] >= thresholds[post.user_reports[0][0]]:
+                        # Approve the submission
+                        try:
+                            post.mod.approve()
+                            print(f'post "{post.title}" approved due to {post.user_reports[0][1]} reports for reason: {post.user_reports[0][0]}')
+                        except prawcore.exceptions.ServerError as e:
+                            handle_exception(e)
+       
+except Exception as e:
+    handle_exception(e)
+
