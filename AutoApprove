@@ -10,7 +10,7 @@ def monitor_reported_posts():
                          user_agent='')
 
 
-    subreddit = reddit.subreddit("PokeLeaks")
+    subreddit = reddit.subreddit("")
     for post in subreddit.mod.reports():
         if post.approved:
             post.mod.approve()
