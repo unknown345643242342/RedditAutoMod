@@ -11,11 +11,11 @@ def handle_exception(e):
 
 try:
     # Set up the Reddit API connection
-    reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
-                         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-                         username='PokeLeakBot3',
-                         password='testbot1',
-                         user_agent='testbot')
+    reddit = praw.Reddit(client_id='',
+                         client_secret='',
+                         username='',
+                         password='',
+                         user_agent='')
 
     # Set up a dictionary of removal reasons to their report threshold
     thresholds = {'Comments complaining about Riddler Khu will be removed. Ignore the post if you are going to complain': 1, 'No insults or harassment of other subreddit members in the comments': 1, 'No asking about or sharing of XCI or NSP files': 1}
