@@ -16,7 +16,7 @@ reddit = praw.Reddit(client_id='',
                      user_agent='')
 
 # Set the subreddit you want the bot to run on
-subreddit = reddit.subreddit('Pokeleaks')
+subreddit = reddit.subreddit('')
 
 # Create a dictionary to store the image hashes, their corresponding submission IDs, and the time of the post
 image_hashes = {}
