@@ -22,7 +22,7 @@ try:
 
     while True:
         # Check the mod queue for new activities
-        for item in reddit.subreddit('Pokeleaks').mod.modqueue(limit=100):
+        for item in reddit.subreddit('').mod.modqueue(limit=100):
             # Check if the item has any user reports
             if item.user_reports:
                 # Check if the report reason is in the threshold dict
