@@ -19,7 +19,7 @@ timers = {}  # Create an empty dictionary to store the start time for each repor
 
 try:
     while True:
-        for item in reddit.subreddit('PokeLeaks').mod.modqueue():
+        for item in reddit.subreddit('').mod.modqueue():
             if item.num_reports == 1 and item.id not in timers:  # Only start timer for new reported items
                 created_time = item.created_utc
                 timers[item.id] = time.time()  # Store start time for this item in the timers dictionary
