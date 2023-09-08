@@ -7,11 +7,11 @@ from keep_alive import keep_alive
 
 
 # Connect to Reddit
-reddit = praw.Reddit(client_id='jl-I3OHYH2_VZMC1feoJMQ',
-                         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-                         username='PokeLeakBot3',
-                         password='testbot1',
-                         user_agent='testbot')
+reddit = praw.Reddit(client_id='',
+                         client_secret='',
+                         username='',
+                         password='',
+                         user_agent='')
 
 # Create a set to store the processed submission IDs
 processed_submission_ids = set()
@@ -20,7 +20,7 @@ processed_submission_ids = set()
 image_hashes = {}
 
 # Set the subreddit you want the bot to run on
-subreddit = reddit.subreddit('PokeLeaks')
+subreddit = reddit.subreddit('')
 
 # Get the current timestamp
 current_time = int(time.time())
@@ -28,7 +28,7 @@ current_time = int(time.time())
 keep_alive()
 while True:
     # Iterate through all submissions in the subreddit
-    for submission in subreddit.new(limit=99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999):
+    for submission in subreddit.new(limit=999):
         # Check if the submission ID has already been processed
         if submission.id in processed_submission_ids:
             # If the submission ID has already been processed, skip it
