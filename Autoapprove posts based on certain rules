@@ -22,7 +22,7 @@ try:
 
     while True:
         # Check the mod queue for new activities
-        for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+        for post in reddit.subreddit('').mod.modqueue(limit=100):
             # Check if the item is a post and has any user reports
             if isinstance(post, praw.models.Submission) and post.user_reports:
                 # Check if the report reason is in the threshold dict
