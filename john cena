@@ -79,23 +79,24 @@ def handle_modqueue_items():
 
 def handle_spoiler_status():
     previous_spoiler_status = {}
+
     while True:
-        make_api_request()
-        for submission in subreddit.new():
+        try:
             make_api_request()
-            if submission.id not in previous_spoiler_status:
-                previous_spoiler_status[submission.id] = submission.spoiler
-                continue
-            if previous_spoiler_status[submission.id] != submission.spoiler:
-                is_moderator = submission.author in subreddit.moderator()
-                if not submission.spoiler and not is_moderator:
-                    try:
+            for submission in subreddit.new():
+                make_api_request()
+                if submission.id in previous_spoiler_status:
+                    if previous_spoiler_status[submission.id] != submission.spoiler:
+                        if submission.spoiler:
+                            comment = submission.reply("This post has been marked as a spoiler.")
+                        else:
+                            comment = submission.reply("This post is no longer marked as a spoiler.")
+                        comment.mod.distinguish(sticky=True)
                         make_api_request()
-                        print(f'Post {submission.id} unmarked as spoiler by non-mod. Re-spoiling.')
-                        submission.mod.spoiler()
-                    except prawcore.exceptions.ServerError as e:
-                        handle_exception(e)
                 previous_spoiler_status[submission.id] = submission.spoiler
+            time.sleep(30)
+        except Exception as e:
+            handle_exception(e)
 
 def handle_user_reports_and_removal():
     thresholds = {
@@ -122,19 +123,20 @@ def handle_user_reports_and_removal():
 
 def handle_submissions_based_on_user_reports():
     thresholds = {'This is misinformation': 1, 'This is spam': 1}
+
     while True:
-        make_api_request()
-        for post in subreddit.mod.modqueue(limit=100):
+        try:
             make_api_request()
-            if isinstance(post, praw.models.Submission) and post.user_reports:
-                reason, count = post.user_reports[0]
-                if reason in thresholds and count >= thresholds[reason]:
-                    try:
-                        make_api_request()
-                        post.mod.approve()
-                        print(f'Post \"{post.title}\" approved due to {count} reports: {reason}')
-                    except prawcore.exceptions.ServerError as e:
-                        handle_exception(e)
+            for post in subreddit.mod.modqueue(limit=100):
+                if post.num_reports >= 1:
+                    for report in post.user_reports:
+                        report_reason = report[0]
+                        if report_reason in thresholds and post.num_reports >= thresholds[report_reason]:
+                            post.mod.remove()
+                            make_api_request()
+            time.sleep(60)
+        except Exception as e:
+            handle_exception(e)
 
 def handle_posts_based_on_removal():
     thresholds = {
@@ -181,136 +183,89 @@ def handle_comments_based_on_approval():
 
 def run_pokemon_duplicate_bot():
     image_hashes = {}
-    moderator_removed_hashes = set()
+    moderator_removed_hashes = set()  # Track images removed by moderators
     processed_modqueue_submissions = set()
+    approved_by_moderator = set()  # Keep track of submissions approved by moderators
     current_time = int(time.time())
 
     def post_comment(submission, original_post_author, original_post_title, original_post_link, original_post_date):
-        max_retries = 3
-        for _ in range(max_retries):
+        max_retries = 3  # Number of times to retry posting the comment
+        retries = 0
+        while retries < max_retries:
             try:
-                make_api_request()
                 comment = submission.reply(
                     ">| Title | Date and Time |\n"
                     ">|:---:|:---:|\n"
                     ">| [{}]({}) | {} |\n\n"
-                    ">[Link to Original Post]({})".format(
-                        original_post_title, original_post_link,
-                        original_post_date, original_post_link)
+                    ">[Link to Original Post]({})"
+                    .format(original_post_title, original_post_link,
+                            original_post_date, original_post_link)
                 )
-                make_api_request()
                 comment.mod.distinguish(sticky=True)
                 print("Duplicate removed and comment posted: ", submission.url)
-                return True
+                return True  # Comment successfully posted
             except Exception as e:
                 handle_exception(e)
-                time.sleep(1)
-        return False
+                retries += 1
+                time.sleep(1)  # Wait for a few seconds before retrying
+        return False  # Comment posting failed after retries
 
     def check_removed_original_posts():
         while True:
-            for hash_value, (submission_id, creation_time) in list(image_hashes.items()):
-                try:
-                    make_api_request()
+            make_api_request()
+            try:
+                for hash_value, (submission_id, creation_time) in list(image_hashes.items()):
                     original_submission = reddit.submission(id=submission_id)
-                    if original_submission.banned_by is not None or original_submission.author is None:
-                        moderator_removed_hashes.add(hash_value)
+                    original_author = original_submission.author
+                    banned_by_moderator = original_submission.banned_by
+
+                    # Check if the post was removed by a moderator
+                    if banned_by_moderator is not None:
+                        moderator_removed_hashes.add(hash_value)  # Add hash to the blocked list
+                        del image_hashes[hash_value]  # Remove the hash from active tracking
+                    elif original_author is None:  # User deleted their post
                         del image_hashes[hash_value]
-                except Exception as e:
-                    handle_exception(e)
-            time.sleep(30)
+            except Exception as e:
+                handle_exception(e)
 
-    threading.Thread(target=check_removed_original_posts, daemon=True).start()
-
-    def process_submission(submission):
-        try:
-            if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                image_data = requests.get(submission.url).content
-                img = np.asarray(bytearray(image_data), dtype=np.uint8)
-                img = cv2.imdecode(img, cv2.IMREAD_COLOR)
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                hash_value = str(imagehash.phash(Image.fromarray(gray)))
-
-                if hash_value in moderator_removed_hashes and not submission.approved:
-                    submission.mod.remove()
-                    print("Repost of a mod-removed image removed: ", submission.url)
-                    return
-
-                if hash_value in image_hashes:
-                    original_id, original_time = image_hashes[hash_value]
-                    original_submission = reddit.submission(id=original_id)
-                    if submission.author != original_submission.author and submission.created_utc > original_time:
-                        if not submission.approved:
-                            submission.mod.remove()
-                            print("Duplicate removed: ", submission.url)
-                            post_comment(
-                                submission,
-                                original_submission.author.name,
-                                original_submission.title,
-                                f"https://www.reddit.com{original_submission.permalink}",
-                                datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
-                            )
-                    else:
-                        image_hashes[hash_value] = (submission.id, submission.created_utc)
-                else:
-                    image_hashes[hash_value] = (submission.id, submission.created_utc)
-        except Exception as e:
-            handle_exception(e)
+    # Start a separate thread to continuously check for removed original posts
+    original_post_checker_thread = threading.Thread(target=check_removed_original_posts)
+    original_post_checker_thread.start()
 
     try:
-        for submission in subreddit.new(limit=100):
-            make_api_request()
-            process_submission(submission)
+        for submission in subreddit.new(limit=99999):
+            if isinstance(submission, praw.models.Submission):
+                print("Scanning image/post: ", submission.url)
+                if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                    try:
+                        image_data = requests.get(submission.url).content
+                        img = np.asarray(bytearray(image_data), dtype=np.uint8)
+                        img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        hash_value = str(imagehash.phash(Image.fromarray(gray)))
+
+                        # Ignore duplicate posts removed by moderators
+                        if hash_value in moderator_removed_hashes:
+                            print(f"Duplicate found and ignored (already removed by mods): {submission.url}")
+                            continue
+
+                        # Check if we already encountered this image hash
+                        if hash_value in image_hashes:
+                            original_submission_id = image_hashes[hash_value][0]
+                            original_submission = reddit.submission(id=original_submission_id)
+                            original_post_date = datetime.utcfromtimestamp(image_hashes[hash_value][1])
+                            original_post_title = original_submission.title
+                            original_post_link = original_submission.url
+
+                            # Post a comment about the duplicate
+                            post_comment(submission, original_submission.author, original_post_title, original_post_link, original_post_date)
+                            submission.mod.remove()
+                            print("Duplicate found: ", submission.url)
+                        else:
+                            # Add this image to tracking
+                            image_hashes[hash_value] = (submission.id, current_time)
+                    except Exception as e:
+                        handle_exception(e)
+            time.sleep(1)  # Delay to not overload the server
     except Exception as e:
         handle_exception(e)
-
-    while True:
-        try:
-            for submission in subreddit.new():
-                make_api_request()
-                if submission.created_utc > current_time:
-                    process_submission(submission)
-                    current_time = int(time.time())
-
-            modqueue_submissions = sorted(
-                subreddit.mod.modqueue(only='submission', limit=None),
-                key=lambda x: x.created_utc
-            )
-
-            for submission in modqueue_submissions:
-                make_api_request()
-                if isinstance(submission, praw.models.Submission):
-                    if submission.num_reports > 0:
-                        print("Skipping reported image: ", submission.url)
-                        image_hashes = {k: v for k, v in image_hashes.items() if v[0] != submission.id}
-                        continue
-                    process_submission(submission)
-        except Exception as e:
-            handle_exception(e)
-
-def monitor_threads(threads):
-    while True:
-        for thread_name, thread in threads.items():
-            if not thread.is_alive():
-                print(f"Thread {thread_name} has stopped. Restarting...")
-                new_thread = threading.Thread(target=thread._target)
-                threads[thread_name] = new_thread
-                new_thread.start()
-        time.sleep(10)
-
-if __name__ == "__main__":
-    threads = {
-        'modqueue_thread': threading.Thread(target=handle_modqueue_items),
-        'reported_posts_thread': threading.Thread(target=monitor_reported_posts),
-        'spoiler_status_thread': threading.Thread(target=handle_spoiler_status),
-        'user_reports_removal_thread': threading.Thread(target=handle_user_reports_and_removal),
-        'submissions_based_on_user_reports_thread': threading.Thread(target=handle_submissions_based_on_user_reports),
-        'posts_based_on_removal_thread': threading.Thread(target=handle_posts_based_on_removal),
-        'comments_based_on_approval_thread': threading.Thread(target=handle_comments_based_on_approval),
-        'run_pokemon_duplicate_bot_thread': threading.Thread(target=run_pokemon_duplicate_bot),
-    }
-
-    for thread in threads.values():
-        thread.start()
-
-    monitor_threads(threads)
