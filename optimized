@@ -1,0 +1,174 @@
+import threading
+import time
+import requests
+import numpy as np
+import cv2
+import imagehash
+from PIL import Image
+from datetime import datetime
+import praw
+import prawcore
+
+# Initialize Reddit instance (replace with actual initialization)
+def initialize_reddit():
+    return praw.Reddit(client_id='your_client_id', 
+                       client_secret='your_client_secret', 
+                       user_agent='your_user_agent')
+
+# Handle exception (replace with actual error handling logic)
+def handle_exception(e):
+    print(f"An error occurred: {e}")
+
+# Make API request (replace with actual API request logic)
+def make_api_request():
+    pass  # Your API logic here
+
+# Main bot function
+def run_pokemon_duplicate_bot():
+    reddit = initialize_reddit()
+    subreddit = reddit.subreddit('PokeLeaks')
+    
+    image_hashes = {}
+    moderator_removed_hashes = set()
+    processed_modqueue_submissions = set()
+    current_time = int(time.time())
+
+    # Post comment function to indicate duplicate submission
+    def post_comment(submission, original_post_author, original_post_title, original_post_link, original_post_date):
+        max_retries = 3  # Number of times to retry posting the comment
+        retries = 0
+        while retries < max_retries:
+            try:
+                comment = submission.reply(
+                    ">| Title | Date and Time |\n"
+                    ">|:---:|:---:|\n"
+                    ">| [{}]({}) | {} |\n\n"
+                    ">[Link to Original Post]({})"
+                    .format(original_post_title, original_post_link,
+                            original_post_date, original_post_link)
+                )
+                comment.mod.distinguish(sticky=True)
+                print("Duplicate removed and comment posted: ", submission.url)
+                return True  # Comment successfully posted
+            except Exception as e:
+                handle_exception(e)
+                retries += 1
+                time.sleep(1)  # Wait for a few seconds before retrying
+        return False  # Comment posting failed after retries
+
+    # Process image submission, download and hash image
+    def process_image_submission(submission):
+        """Process an image submission, checking for duplicates and handling reposts."""
+        try:
+            image_data = requests.get(submission.url).content
+            img = np.asarray(bytearray(image_data), dtype=np.uint8)
+            img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            hash_value = str(imagehash.phash(Image.fromarray(gray)))
+
+            # Block reposts of moderator-removed images
+            if hash_value in moderator_removed_hashes:
+                if not submission.approved:
+                    submission.mod.remove()
+                    print("Repost of a moderator-removed image removed: ", submission.url)
+                    return None  # Skip further processing if removed by moderator
+
+            return hash_value
+        except Exception as e:
+            handle_exception(e)
+            return None  # Return None in case of failure
+
+    # Handle duplicate submission (removal, comment, etc.)
+    def handle_duplicate_submission(submission, original_submission, hash_value):
+        """Handle duplicate submission by removing it and posting a comment."""
+        original_post_author = original_submission.author
+        original_post_link = f"https://www.reddit.com{original_submission.permalink}"
+        original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+        original_post_title = original_submission.title
+
+        if submission.created_utc > original_submission.created_utc:
+            if not submission.approved:
+                submission.mod.remove()
+                print("Duplicate removed: ", submission.url)
+                post_comment(submission, original_post_author.name, original_post_title, original_post_link, original_post_date)
+            else:
+                image_hashes[hash_value] = (submission.id, submission.created_utc)
+        else:
+            image_hashes[hash_value] = (submission.id, submission.created_utc)
+
+    # Check submission for duplicates and handle accordingly
+    def check_submission_for_duplicates(submission):
+        """Check if a submission is a duplicate or repost."""
+        hash_value = process_image_submission(submission)
+        if not hash_value:
+            return
+
+        if hash_value in image_hashes:
+            original_submission_id, original_time = image_hashes[hash_value]
+            original_submission = reddit.submission(id=original_submission_id)
+            handle_duplicate_submission(submission, original_submission, hash_value)
+        else:
+            image_hashes[hash_value] = (submission.id, submission.created_utc)
+
+    # Process submission from the mod queue
+    def process_modqueue_submission(submission):
+        """Process a submission from the mod queue."""
+        if submission.num_reports > 0:
+            print("Skipping reported image: ", submission.url)
+            image_hashes = {k: v for k, v in image_hashes.items() if v[0] != submission.id}
+            return
+
+        check_submission_for_duplicates(submission)
+        processed_modqueue_submissions.add(submission.id)
+
+    # Check for removed original posts in a separate thread
+    def check_removed_original_posts():
+        """Check for removed original posts and update the hash list accordingly."""
+        while True:
+            make_api_request()
+            try:
+                for hash_value, (submission_id, creation_time) in list(image_hashes.items()):
+                    original_submission = reddit.submission(id=submission_id)
+                    original_author = original_submission.author
+                    banned_by_moderator = original_submission.banned_by
+
+                    # Check if the post was removed by a moderator
+                    if banned_by_moderator is not None:
+                        moderator_removed_hashes.add(hash_value)  # Add hash to the blocked list
+                        del image_hashes[hash_value]  # Remove the hash from active tracking
+                    elif original_author is None:  # User deleted their post
+                        del image_hashes[hash_value]
+            except Exception as e:
+                handle_exception(e)
+
+    # Start a thread to check for removed posts
+    original_post_checker_thread = threading.Thread(target=check_removed_original_posts)
+    original_post_checker_thread.start()
+
+    try:
+        for submission in subreddit.new(limit=99999):
+            if isinstance(submission, praw.models.Submission):
+                print("Scanning image/post: ", submission.url)
+                if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                    check_submission_for_duplicates(submission)
+
+        while True:
+            make_api_request()
+            for submission in subreddit.new():
+                if submission.created_utc > current_time:
+                    if isinstance(submission, praw.models.Submission):
+                        print("Scanning new image/post: ", submission.url)
+                        if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                            check_submission_for_duplicates(submission)
+
+            modqueue_submissions = subreddit.mod.modqueue(only='submission', limit=None)
+            modqueue_submissions = sorted(modqueue_submissions, key=lambda x: x.created_utc)
+
+            for submission in modqueue_submissions:
+                if isinstance(submission, praw.models.Submission):
+                    print("Scanning Mod Queue: ", submission.url)
+                    process_modqueue_submission(submission)
+
+    except prawcore.exceptions.ServerError:
+        handle_exception()
+
