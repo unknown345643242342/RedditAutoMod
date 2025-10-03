@@ -338,13 +338,14 @@ def run_pokemon_duplicate_bot():
                                             print("Duplicate removed by ORB + AI: ", submission.url)
                                             is_duplicate_orb = True
                                             break
-                            if not is_duplicate_orb and not submission.approved:
-                                submission.mod.approve()
-                                print("Original submission approved (image worker - modqueue): ", submission.url)
-                            if hash_value not in image_hashes:
-                                image_hashes[hash_value] = (submission.id, submission.created_utc)
-                                orb_descriptors[submission.id] = descriptors
-                                ai_features[submission.id] = new_features
+                            if not is_duplicate_orb:
+                                if not submission.approved:
+                                    submission.mod.approve()
+                                    print("Original submission approved (image worker - modqueue): ", submission.url)
+                                if hash_value not in image_hashes:
+                                    image_hashes[hash_value] = (submission.id, submission.created_utc)
+                                    orb_descriptors[submission.id] = descriptors
+                                    ai_features[submission.id] = new_features
                             processed_modqueue_submissions.add(submission.id)
                         except Exception as e:
                             handle_exception(e)
@@ -360,6 +361,7 @@ def run_pokemon_duplicate_bot():
                     if not submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                         continue
                     if submission.id in processed_modqueue_submissions:
+                        print("Skipping already processed submission (from modqueue): ", submission.url)
                         continue
                     print("Scanning new submission (image worker - stream): ", submission.url)
                     image_data = requests.get(submission.url).content
@@ -433,13 +435,14 @@ def run_pokemon_duplicate_bot():
                                     print("Duplicate removed by ORB + AI (stream): ", submission.url)
                                     is_duplicate_orb = True
                                     break
-                    if not is_duplicate_orb and not submission.approved:
-                        submission.mod.approve()
-                        print("Original submission approved (image stream): ", submission.url)
-                    if hash_value not in image_hashes:
-                        image_hashes[hash_value] = (submission.id, submission.created_utc)
-                        orb_descriptors[submission.id] = descriptors
-                        ai_features[submission.id] = new_features
+                    if not is_duplicate_orb:
+                        if not submission.approved:
+                            submission.mod.approve()
+                            print("Original submission approved (image stream): ", submission.url)
+                        if hash_value not in image_hashes:
+                            image_hashes[hash_value] = (submission.id, submission.created_utc)
+                            orb_descriptors[submission.id] = descriptors
+                            ai_features[submission.id] = new_features
                     processed_modqueue_submissions.add(submission.id)
                 except Exception as e:
                     handle_exception(e)
