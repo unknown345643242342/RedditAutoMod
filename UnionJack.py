@@ -63,6 +63,26 @@ def run_pokemon_duplicate_bot():
         matches = bf.match(desc1, desc2)
         return len(matches) / min(len(desc1), len(desc2))
 
+    def process_gif_sample(url, max_frames=5):
+        """Download and sample a few frames from a GIF"""
+        try:
+            from PIL import Image as PILImage
+            import io
+            response = requests.get(url, timeout=10)
+            gif = PILImage.open(io.BytesIO(response.content))
+            frame_count = getattr(gif, 'n_frames', 1)
+            frames_to_sample = min(max_frames, frame_count)
+            sampled_frames = []
+            for i in range(frames_to_sample):
+                frame_idx = int(i * frame_count / frames_to_sample)
+                gif.seek(frame_idx)
+                frame = gif.convert('RGB')
+                sampled_frames.append(np.array(frame))
+            return sampled_frames
+        except Exception as e:
+            print(f"Error processing GIF: {e}")
+            return None
+
     def format_age(utc_timestamp):
         now = datetime.now(timezone.utc)
         created = datetime.fromtimestamp(utc_timestamp, tz=timezone.utc)
@@ -180,9 +200,9 @@ def run_pokemon_duplicate_bot():
             for submission in subreddit.new(limit=10):
                 if isinstance(submission, praw.models.Submission):
                     try:
-                        if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                        if submission.url.endswith(('jpg', 'jpeg', 'png')):
                             print("Indexing submission (initial scan): ", submission.url)
-                            image_data = requests.get(submission.url).content
+                            image_data = requests.get(submission.url, timeout=10).content
                             img = np.asarray(bytearray(image_data), dtype=np.uint8)
                             img = cv2.imdecode(img, cv2.IMREAD_COLOR)
                             hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
@@ -191,6 +211,19 @@ def run_pokemon_duplicate_bot():
                                 image_hashes[hash_value] = (submission.id, submission.created_utc)
                                 orb_descriptors[submission.id] = descriptors
                                 ai_features[submission.id] = get_ai_features(img)
+                        elif submission.url.endswith('gif'):
+                            print("Indexing GIF submission (initial scan): ", submission.url)
+                            frames = process_gif_sample(submission.url)
+                            if frames:
+                                for frame in frames:
+                                    hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY))))
+                                    if hash_value not in image_hashes:
+                                        image_hashes[hash_value] = (submission.id, submission.created_utc)
+                                        # Use first frame for ORB and AI
+                                if frames and submission.id not in orb_descriptors:
+                                    first_frame_bgr = cv2.cvtColor(frames[0], cv2.COLOR_RGB2BGR)
+                                    orb_descriptors[submission.id] = get_orb_descriptors_conditional(first_frame_bgr)
+                                    ai_features[submission.id] = get_ai_features(first_frame_bgr)
                         elif submission.is_video and 'v.redd.it' in submission.url:
                             print("Indexing video submission (initial scan): ", submission.url)
                             try:
@@ -264,10 +297,19 @@ def run_pokemon_duplicate_bot():
                             ai_features = {k: v for k, v in ai_features.items() if (not isinstance(k, int)) or k != submission.id}
                             continue
                         try:
-                            image_data = requests.get(submission.url).content
-                            img = np.asarray(bytearray(image_data), dtype=np.uint8)
-                            img = cv2.imdecode(img, cv2.IMREAD_COLOR)
-                            hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
+                            is_gif = submission.url.endswith('gif')
+                            if is_gif:
+                                print("Processing GIF (modqueue): ", submission.url)
+                                frames = process_gif_sample(submission.url)
+                                if not frames:
+                                    continue
+                                img = cv2.cvtColor(frames[0], cv2.COLOR_RGB2BGR)
+                                hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
+                            else:
+                                image_data = requests.get(submission.url, timeout=10).content
+                                img = np.asarray(bytearray(image_data), dtype=np.uint8)
+                                img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+                                hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
                             descriptors = get_orb_descriptors_conditional(img)
                             new_features = get_ai_features(img)
                             ai_features[submission.id] = new_features
@@ -364,10 +406,20 @@ def run_pokemon_duplicate_bot():
                         print("Skipping already processed submission (from modqueue): ", submission.url)
                         continue
                     print("Scanning new submission (image worker - stream): ", submission.url)
-                    image_data = requests.get(submission.url).content
-                    img = np.asarray(bytearray(image_data), dtype=np.uint8)
-                    img = cv2.imdecode(img, cv2.IMREAD_COLOR)
-                    hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
+                    
+                    is_gif = submission.url.endswith('gif')
+                    if is_gif:
+                        print("Processing GIF (stream): ", submission.url)
+                        frames = process_gif_sample(submission.url)
+                        if not frames:
+                            continue
+                        img = cv2.cvtColor(frames[0], cv2.COLOR_RGB2BGR)
+                        hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
+                    else:
+                        image_data = requests.get(submission.url, timeout=10).content
+                        img = np.asarray(bytearray(image_data), dtype=np.uint8)
+                        img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+                        hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
                     descriptors = get_orb_descriptors_conditional(img)
                     new_features = get_ai_features(img)
                     ai_features[submission.id] = new_features
