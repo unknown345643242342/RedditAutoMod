@@ -1,3 +1,4 @@
+
 def run_pokemon_duplicate_bot():
     reddit = initialize_reddit()
     subreddit = reddit.subreddit('pythonbottest333')
@@ -115,7 +116,8 @@ def run_pokemon_duplicate_bot():
                 "quiet": True,
                 "outtmpl": outtmpl,
                 "download_sections": [f"*00:00:00-00:00:{duration_seconds:02d}"],
-            }
+                "cookiefile": "/home/pi/Downloads/cookies.txt",
+           }
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
                 ydl.download([url])
             files = glob.glob(os.path.join(tmpdir, "sample.*"))
@@ -170,7 +172,7 @@ def run_pokemon_duplicate_bot():
                         print(f"[USER REMOVE] Original video {submission_id} removed by user. Hash deleted.")
             except Exception as e:
                 handle_exception(e)
-            time.sleep(5)
+          
 
     threading.Thread(target=check_removed_original_posts, daemon=True).start()
 
@@ -575,3 +577,4 @@ def run_pokemon_duplicate_bot():
 
         while True:
             time.sleep(5)
+
