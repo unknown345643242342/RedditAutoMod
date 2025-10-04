@@ -133,13 +133,13 @@ def run_pokemon_duplicate_bot():
     def check_hash_duplicate(submission, hash_value, new_features):
         """Check if submission is a hash-based duplicate"""
         if hash_value not in image_hashes:
-            return False, None, None, None, None, None
+            return False, None, None, None, None, None, None
         
         original_id, original_time = image_hashes[hash_value]
         
         # Skip if same submission or older
         if submission.id == original_id or submission.created_utc <= original_time:
-            return False, None, None, None, None, None
+            return False, None, None, None, None, None, None
         
         original_submission = reddit.submission(id=original_id)
         original_features = get_cached_ai_features(original_submission.id)
@@ -152,7 +152,7 @@ def run_pokemon_duplicate_bot():
             original_status = "Removed by Moderator" if hash_value in moderator_removed_hashes else "Active"
             return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
         
-        return False, None, None, None, None, None
+        return False, None, None, None, None, None, None
 
     def check_orb_duplicate(submission, descriptors, new_features):
         """Check if submission is an ORB-based duplicate"""
@@ -171,7 +171,7 @@ def run_pokemon_duplicate_bot():
                     
                     return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
         
-        return False, None, None, None, None, None
+        return False, None, None, None, None, None, None
 
     def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink):
         """Remove duplicate and post comment if not approved"""
@@ -301,8 +301,8 @@ def run_pokemon_duplicate_bot():
                     
                     if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                         is_duplicate = process_submission_for_duplicates(submission, context="modqueue")
-                        if is_duplicate:
-                            processed_modqueue_submissions.add(submission.id)
+                        # Always add to processed set so it doesn't get reprocessed in stream
+                        processed_modqueue_submissions.add(submission.id)
 
             except Exception as e:
                 handle_exception(e)
