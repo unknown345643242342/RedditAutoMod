@@ -1,17 +1,15 @@
-
 def run_pokemon_duplicate_bot():
     reddit = initialize_reddit()
-    subreddit = reddit.subreddit('pythonbottest333')
+    subreddit = reddit.subreddit('PokeLeaks')
     image_hashes = {}
-    orb_descriptors = {}  # Store ORB descriptors for images
-    video_hashes = {}  # Store hashes for video frames
-    moderator_removed_hashes = set()  # Track images/videos removed by moderators
+    orb_descriptors = {}
+    moderator_removed_hashes = set()
     processed_modqueue_submissions = set()
-    approved_by_moderator = set()  # Track submissions approved by moderators
-    ai_features = {}  # Cache AI feature vectors for IMAGES ONLY
+    approved_by_moderator = set()
+    ai_features = {}
     current_time = int(time.time())
 
-    # --- Tiny AI similarity model (for images only) ---
+    # --- Tiny AI similarity model ---
     device = "cpu"
     resnet_model = models.resnet18(pretrained=True)
     resnet_model.eval()
@@ -103,36 +101,143 @@ def run_pokemon_duplicate_bot():
                 time.sleep(1)
         return False
 
-    # Helper: download a short clip via yt-dlp (returns local path or None)
-    def download_sample_video(url, duration_seconds=180):
+    # --- NEW: Consolidated helper functions ---
+    def load_and_process_image(url):
+        """Load image from URL and compute hash, descriptors, and AI features"""
+        image_data = requests.get(url).content
+        img = np.asarray(bytearray(image_data), dtype=np.uint8)
+        img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+        hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
+        descriptors = get_orb_descriptors_conditional(img)
+        features = get_ai_features(img)
+        return img, hash_value, descriptors, features
+
+    def get_cached_ai_features(submission_id):
+        """Get AI features from cache or compute them"""
+        if submission_id in ai_features:
+            return ai_features[submission_id]
+        
+        old_submission = reddit.submission(id=submission_id)
+        old_image_data = requests.get(old_submission.url).content
+        old_img = cv2.imdecode(np.asarray(bytearray(old_image_data), dtype=np.uint8), cv2.IMREAD_COLOR)
+        old_features = get_ai_features(old_img)
+        ai_features[submission_id] = old_features
+        return old_features
+
+    def calculate_ai_similarity(features1, features2):
+        """Calculate AI similarity score between two feature vectors"""
+        if features1 is not None and features2 is not None:
+            return (features1 @ features2.T).item()
+        return 0
+
+    def check_hash_duplicate(submission, hash_value, new_features):
+        """Check if submission is a hash-based duplicate"""
+        if hash_value not in image_hashes:
+            return False, None, None, None, None, None
+        
+        original_id, original_time = image_hashes[hash_value]
+        
+        # Skip if same submission or older
+        if submission.id == original_id or submission.created_utc <= original_time:
+            return False, None, None, None, None, None
+        
+        original_submission = reddit.submission(id=original_id)
+        original_features = get_cached_ai_features(original_submission.id)
+        ai_score = calculate_ai_similarity(new_features, original_features)
+        
+        print(f"Hash match detected. AI similarity: {ai_score:.2f}")
+        
+        if ai_score > 0.70:
+            original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+            original_status = "Removed by Moderator" if hash_value in moderator_removed_hashes else "Active"
+            return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
+        
+        return False, None, None, None, None, None
+
+    def check_orb_duplicate(submission, descriptors, new_features):
+        """Check if submission is an ORB-based duplicate"""
+        for old_id, old_desc in orb_descriptors.items():
+            sim = orb_similarity(descriptors, old_desc)
+            
+            if sim > 0.30:
+                old_features = get_cached_ai_features(old_id)
+                ai_score = calculate_ai_similarity(new_features, old_features)
+                
+                if ai_score > 0.70:
+                    original_submission = reddit.submission(id=old_id)
+                    original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+                    old_hash = next((h for h, v in image_hashes.items() if v[0] == old_id), None)
+                    original_status = "Removed by Moderator" if old_hash and old_hash in moderator_removed_hashes else "Active"
+                    
+                    return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
+        
+        return False, None, None, None, None, None
+
+    def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink):
+        """Remove duplicate and post comment if not approved"""
+        if not submission.approved:
+            submission.mod.remove()
+            post_comment(submission, author, title, date, utc, status, permalink)
+            print(f"Duplicate removed by {detection_method}: {submission.url}")
+        return True
+
+    def handle_moderator_removed_repost(submission, hash_value):
+        """Handle reposts of moderator-removed images"""
+        if hash_value in moderator_removed_hashes and not submission.approved:
+            submission.mod.remove()
+            original_submission = reddit.submission(id=image_hashes[hash_value][0])
+            post_comment(
+                submission,
+                original_submission.author.name,
+                original_submission.title,
+                datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
+                original_submission.created_utc,
+                "Removed by Moderator",
+                original_submission.permalink
+            )
+            print("Repost of a moderator-removed image removed: ", submission.url)
+            return True
+        return False
+
+    def process_submission_for_duplicates(submission, context="stream"):
+        """Main duplicate detection logic - works for both mod queue and stream"""
         try:
-            import yt_dlp
-            import tempfile, os, glob, shutil
-            tmpdir = tempfile.mkdtemp(prefix="ytclip_")
-            outtmpl = os.path.join(tmpdir, "sample.%(ext)s")
-            dl_opts = {
-                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
-                "noplaylist": True,
-                "quiet": True,
-                "outtmpl": outtmpl,
-                "download_sections": [f"*00:00:00-00:00:{duration_seconds:02d}"],
-                "cookiefile": "/home/pi/Downloads/cookies.txt",
-           }
-            with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                ydl.download([url])
-            files = glob.glob(os.path.join(tmpdir, "sample.*"))
-            if not files:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return None
-            return files[0]
+            img, hash_value, descriptors, new_features = load_and_process_image(submission.url)
+            ai_features[submission.id] = new_features
+            
+            # Check for moderator-removed reposts first
+            if handle_moderator_removed_repost(submission, hash_value):
+                return True
+            
+            # Check hash-based duplicates
+            is_duplicate, author, title, date, utc, status, permalink = check_hash_duplicate(
+                submission, hash_value, new_features
+            )
+            if is_duplicate:
+                return handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink)
+            
+            # Check ORB-based duplicates
+            is_duplicate, author, title, date, utc, status, permalink = check_orb_duplicate(
+                submission, descriptors, new_features
+            )
+            if is_duplicate:
+                return handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink)
+            
+            # Not a duplicate - approve if in mod queue and store data
+            if context == "modqueue" and not submission.approved:
+                submission.mod.approve()
+                print("Original submission approved: ", submission.url)
+            
+            if hash_value not in image_hashes:
+                image_hashes[hash_value] = (submission.id, submission.created_utc)
+                orb_descriptors[submission.id] = descriptors
+                ai_features[submission.id] = new_features
+            
+            return False
+            
         except Exception as e:
-            try:
-                import shutil
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
-            print("yt-dlp download failed or not available for URL:", url, "error:", e)
-            return None
+            handle_exception(e)
+            return False
 
     def check_removed_original_posts():
         while True:
@@ -141,440 +246,84 @@ def run_pokemon_duplicate_bot():
                     original_submission = reddit.submission(id=submission_id)
                     original_author = original_submission.author
                     banned_by_moderator = original_submission.banned_by
+
                     if banned_by_moderator is not None:
                         if hash_value not in moderator_removed_hashes:
                             moderator_removed_hashes.add(hash_value)
                             print(f"[MOD REMOVE] Original submission {submission_id} removed by a moderator. Hash kept.")
                     elif original_author is None:
-                        try:
-                            del image_hashes[hash_value]
-                        except Exception:
-                            pass
+                        del image_hashes[hash_value]
                         if submission_id in orb_descriptors:
                             del orb_descriptors[submission_id]
                         if submission_id in ai_features:
                             del ai_features[submission_id]
                         print(f"[USER REMOVE] Original submission {submission_id} removed by user. Hash deleted.")
-
-                for vid_hash, (submission_id, creation_time) in list(video_hashes.items()):
-                    original_submission = reddit.submission(id=submission_id)
-                    original_author = original_submission.author
-                    banned_by_moderator = original_submission.banned_by
-                    if banned_by_moderator is not None:
-                        if vid_hash not in moderator_removed_hashes:
-                            moderator_removed_hashes.add(vid_hash)
-                            print(f"[MOD REMOVE] Original video {submission_id} removed by a moderator. Hash kept.")
-                    elif original_author is None:
-                        try:
-                            del video_hashes[vid_hash]
-                        except Exception:
-                            pass
-                        print(f"[USER REMOVE] Original video {submission_id} removed by user. Hash deleted.")
             except Exception as e:
                 handle_exception(e)
-          
 
     threading.Thread(target=check_removed_original_posts, daemon=True).start()
 
     # --- Initial scan ---
-    def initial_scan():
+    try:
+        for submission in subreddit.new(limit=200):
+            if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                print("Indexing submission (initial scan): ", submission.url)
+                try:
+                    img, hash_value, descriptors, features = load_and_process_image(submission.url)
+                    if hash_value not in image_hashes:
+                        image_hashes[hash_value] = (submission.id, submission.created_utc)
+                        orb_descriptors[submission.id] = descriptors
+                        ai_features[submission.id] = features
+                except Exception as e:
+                    handle_exception(e)
+    except Exception as e:
+        handle_exception(e)
+
+    # --- Mod Queue worker ---
+    def modqueue_worker():
+        nonlocal image_hashes, orb_descriptors, moderator_removed_hashes, processed_modqueue_submissions, ai_features
+        while True:
+            try:
+                modqueue_submissions = subreddit.mod.modqueue(only='submission', limit=None)
+                modqueue_submissions = sorted(modqueue_submissions, key=lambda x: x.created_utc)
+                for submission in modqueue_submissions:
+                    if not isinstance(submission, praw.models.Submission):
+                        continue
+                    
+                    print("Scanning Mod Queue: ", submission.url)
+                    
+                    if submission.num_reports > 0:
+                        print("Skipping reported image: ", submission.url)
+                        image_hashes = {k: v for k, v in image_hashes.items() if v[0] != submission.id}
+                        orb_descriptors.pop(submission.id, None)
+                        ai_features.pop(submission.id, None)
+                        continue
+                    
+                    if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                        is_duplicate = process_submission_for_duplicates(submission, context="modqueue")
+                        if is_duplicate:
+                            processed_modqueue_submissions.add(submission.id)
+
+            except Exception as e:
+                handle_exception(e)
+            time.sleep(2)
+
+    threading.Thread(target=modqueue_worker, daemon=True).start()
+
+    # --- Stream new submissions ---
+    while True:
         try:
-            for submission in subreddit.new(limit=50):
-                if isinstance(submission, praw.models.Submission):
-                    try:
-                        if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                            print("Indexing submission (initial scan): ", submission.url)
-                            image_data = requests.get(submission.url).content
-                            img = np.asarray(bytearray(image_data), dtype=np.uint8)
-                            img = cv2.imdecode(img, cv2.IMREAD_COLOR)
-                            hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
-                            if hash_value not in image_hashes:
-                                descriptors = get_orb_descriptors_conditional(img)
-                                image_hashes[hash_value] = (submission.id, submission.created_utc)
-                                orb_descriptors[submission.id] = descriptors
-                                ai_features[submission.id] = get_ai_features(img)
-                        elif submission.is_video and 'v.redd.it' in submission.url:
-                            print("Indexing video submission (initial scan): ", submission.url)
-                            try:
-                                video_url = submission.media['reddit_video']['fallback_url']
-                                cap = cv2.VideoCapture(video_url)
-                                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                                sample_frames = min(100, frame_count)
-                                for i in range(sample_frames):
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                    ret, frame = cap.read()
-                                    if not ret:
-                                        continue
-                                    hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-                                    if hash_value not in video_hashes:
-                                        video_hashes[hash_value] = (submission.id, submission.created_utc)
-                                cap.release()
-                            except Exception as e:
-                                handle_exception(e)
-                        else:
-                            try:
-                                print("Attempting to index external video (initial scan): ", submission.url)
-                                local_clip = download_sample_video(submission.url, duration_seconds=5)
-                                if local_clip is None:
-                                    continue
-                                cap = cv2.VideoCapture(local_clip)
-                                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                                sample_frames = min(100, frame_count)
-                                for i in range(sample_frames):
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                    ret, frame = cap.read()
-                                    if not ret:
-                                        continue
-                                    hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-                                    if hash_value not in video_hashes:
-                                        video_hashes[hash_value] = (submission.id, submission.created_utc)
-                                cap.release()
-                                try:
-                                    import os, shutil
-                                    shutil.rmtree(os.path.dirname(local_clip), ignore_errors=True)
-                                except Exception:
-                                    pass
-                            except Exception as e:
-                                handle_exception(e)
-                    except Exception as e:
-                        handle_exception(e)
+            for submission in subreddit.stream.submissions(skip_existing=True):
+                if submission.created_utc > current_time and isinstance(submission, praw.models.Submission):
+                    # Skip originals already approved in mod queue
+                    if submission.id in processed_modqueue_submissions:
+                        continue
+
+                    print("Scanning new image/post: ", submission.url)
+                    
+                    if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                        process_submission_for_duplicates(submission, context="stream")
+
+            current_time = int(time.time())
         except Exception as e:
             handle_exception(e)
-
-    initial_scan()  # run only once
-
-    # --- Video worker (now splits modqueue and stream into separate inner functions) ---
-    def video_worker():
-        nonlocal video_hashes, moderator_removed_hashes, processed_modqueue_submissions
-
-        def video_modqueue():
-            nonlocal video_hashes, moderator_removed_hashes, processed_modqueue_submissions
-            while True:
-                try:
-                    modqueue_submissions = subreddit.mod.modqueue(only='submission', limit=None)
-                    modqueue_submissions = sorted(modqueue_submissions, key=lambda x: x.created_utc)
-                    for submission in modqueue_submissions:
-                        if not isinstance(submission, praw.models.Submission):
-                            continue
-                        if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                            continue
-
-                        print("Scanning Mod Queue (video worker - modqueue): ", submission.url)
-
-                        if submission.num_reports > 0:
-                            print("Skipping reported submission: ", submission.url)
-                            video_hashes = {k: v for k, v in video_hashes.items() if v[0] != submission.id}
-                            continue
-
-                        if submission.is_video and 'v.redd.it' in submission.url:
-                            try:
-                                video_url = submission.media['reddit_video']['fallback_url']
-                                cap = cv2.VideoCapture(video_url)
-                                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                                sample_frames = min(100, frame_count)
-                                duplicate_detected = False
-
-                                for i in range(sample_frames):
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                    ret, frame = cap.read()
-                                    if not ret:
-                                        continue
-                                    hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-
-                                    if hash_value in moderator_removed_hashes and not submission.approved:
-                                        try:
-                                            original_submission_id = video_hashes[hash_value][0]
-                                            original_submission = reddit.submission(id=original_submission_id)
-                                            submission.mod.remove()
-                                            post_comment(submission, original_submission.author.name, original_submission.title,
-                                                       datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                       original_submission.created_utc, "Removed by Moderator", original_submission.permalink)
-                                            print("Repost of a moderator-removed video frame removed: ", submission.url)
-                                            duplicate_detected = True
-                                            processed_modqueue_submissions.add(submission.id)
-                                            break
-                                        except Exception:
-                                            pass
-
-                                    if hash_value in video_hashes:
-                                        original_id, _ = video_hashes[hash_value]
-                                        if not submission.approved:
-                                            submission.mod.remove()
-                                            original_submission = reddit.submission(id=original_id)
-                                            post_comment(submission, original_submission.author.name, original_submission.title,
-                                                       datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                       original_submission.created_utc, "Active", original_submission.permalink)
-                                            print("Duplicate video frame removed: ", submission.url)
-                                            duplicate_detected = True
-                                            processed_modqueue_submissions.add(submission.id)
-                                            break
-
-                                cap.release()
-
-                                if not duplicate_detected and not submission.approved:
-                                    submission.mod.approve()
-                                    print("Original video approved (v.redd.it): ", submission.url)
-                                    processed_modqueue_submissions.add(submission.id)
-
-                                if not duplicate_detected:
-                                    cap = cv2.VideoCapture(video_url)
-                                    for i in range(sample_frames):
-                                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                        ret, frame = cap.read()
-                                        if not ret:
-                                            continue
-                                        hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-                                        if hash_value not in video_hashes:
-                                            video_hashes[hash_value] = (submission.id, submission.created_utc)
-                                    cap.release()
-                            except Exception as e:
-                                handle_exception(e)
-
-                        else:
-                            try:
-                                local_clip = download_sample_video(submission.url, duration_seconds=180)
-                                if local_clip is None:
-                                    continue
-                                cap = cv2.VideoCapture(local_clip)
-                                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                                sample_frames = min(100, frame_count)
-                                duplicate_detected = False
-
-                                for i in range(sample_frames):
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                    ret, frame = cap.read()
-                                    if not ret:
-                                        continue
-                                    hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-
-                                    if hash_value in moderator_removed_hashes and not submission.approved:
-                                        try:
-                                            original_submission_id = video_hashes[hash_value][0]
-                                            original_submission = reddit.submission(id=original_submission_id)
-                                            submission.mod.remove()
-                                            post_comment(submission, original_submission.author.name, original_submission.title,
-                                                       datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                       original_submission.created_utc, "Removed by Moderator", original_submission.permalink)
-                                            print("Duplicate external video frame removed (moderator-removed): ", submission.url)
-                                            duplicate_detected = True
-                                            processed_modqueue_submissions.add(submission.id)
-                                            break
-                                        except Exception:
-                                            pass
-
-                                    if hash_value in video_hashes:
-                                        if not submission.approved:
-                                            submission.mod.remove()
-                                            original_id, _ = video_hashes[hash_value]
-                                            original_submission = reddit.submission(id=original_id)
-                                            post_comment(submission, original_submission.author.name, original_submission.title,
-                                                       datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                       original_submission.created_utc, "Active", original_submission.permalink)
-                                            print("Duplicate external video frame removed: ", submission.url)
-                                            duplicate_detected = True
-                                            processed_modqueue_submissions.add(submission.id)
-                                            break
-
-                                cap.release()
-                                try:
-                                    import os, shutil
-                                    shutil.rmtree(os.path.dirname(local_clip), ignore_errors=True)
-                                except Exception:
-                                    pass
-
-                                if not duplicate_detected and not submission.approved:
-                                    submission.mod.approve()
-                                    print("Original external video approved: ", submission.url)
-                                    processed_modqueue_submissions.add(submission.id)
-
-                                if not duplicate_detected:
-                                    local_clip = download_sample_video(submission.url, duration_seconds=5)
-                                    if local_clip is not None:
-                                        cap = cv2.VideoCapture(local_clip)
-                                        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                                        sample_frames = min(100, frame_count)
-                                        for i in range(sample_frames):
-                                            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                            ret, frame = cap.read()
-                                            if not ret:
-                                                continue
-                                            hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-                                            if hash_value not in video_hashes:
-                                                video_hashes[hash_value] = (submission.id, submission.created_utc)
-                                        cap.release()
-                                        try:
-                                            import shutil, os
-                                            shutil.rmtree(os.path.dirname(local_clip), ignore_errors=True)
-                                        except Exception:
-                                            pass
-                            except Exception as e:
-                                handle_exception(e)
-                    time.sleep(5)
-                except Exception as e:
-                    handle_exception(e)
-                    time.sleep(5)
-
-        def video_stream():
-            nonlocal video_hashes, moderator_removed_hashes, processed_modqueue_submissions
-            for submission in subreddit.stream.submissions(skip_existing=True):
-                try:
-                    if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                        continue
-                    if submission.id in processed_modqueue_submissions:
-                        print(f"Skipping already processed submission from modqueue: {submission.url}")
-                        continue
-
-                    print("Scanning new submission (video worker - stream): ", submission.url)
-
-                    if submission.is_video and 'v.redd.it' in submission.url:
-                        try:
-                            video_url = submission.media['reddit_video']['fallback_url']
-                            cap = cv2.VideoCapture(video_url)
-                            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                            sample_frames = min(100, frame_count)
-                            duplicate_detected = False
-
-                            for i in range(sample_frames):
-                                cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                ret, frame = cap.read()
-                                if not ret:
-                                    continue
-                                hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-
-                                if hash_value in moderator_removed_hashes and not submission.approved:
-                                    try:
-                                        original_submission_id = video_hashes[hash_value][0]
-                                        original_submission = reddit.submission(id=original_submission_id)
-                                        submission.mod.remove()
-                                        post_comment(submission, original_submission.author.name, original_submission.title,
-                                                   datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                   original_submission.created_utc, "Removed by Moderator", original_submission.permalink)
-                                        print("Duplicate video frame removed (moderator-removed): ", submission.url)
-                                        duplicate_detected = True
-                                        processed_modqueue_submissions.add(submission.id)
-                                        break
-                                    except Exception:
-                                        pass
-
-                                if hash_value in video_hashes:
-                                    if not submission.approved:
-                                        submission.mod.remove()
-                                        original_id, _ = video_hashes[hash_value]
-                                        original_submission = reddit.submission(id=original_id)
-                                        post_comment(submission, original_submission.author.name, original_submission.title,
-                                                   datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                   original_submission.created_utc, "Active", original_submission.permalink)
-                                        print("Duplicate video frame removed: ", submission.url)
-                                        duplicate_detected = True
-                                        processed_modqueue_submissions.add(submission.id)
-                                        break
-
-                            cap.release()
-
-                            if not duplicate_detected and not submission.approved:
-                                submission.mod.approve()
-                                print("Original video approved (v.redd.it stream): ", submission.url)
-                                processed_modqueue_submissions.add(submission.id)
-
-                            if not duplicate_detected:
-                                cap = cv2.VideoCapture(video_url)
-                                for i in range(sample_frames):
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                    ret, frame = cap.read()
-                                    if not ret:
-                                        continue
-                                    hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-                                    if hash_value not in video_hashes:
-                                        video_hashes[hash_value] = (submission.id, submission.created_utc)
-                                cap.release()
-                        except Exception as e:
-                            handle_exception(e)
-
-                    else:
-                        try:
-                            local_clip = download_sample_video(submission.url, duration_seconds=180)
-                            if local_clip is None:
-                                continue
-                            cap = cv2.VideoCapture(local_clip)
-                            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                            sample_frames = min(100, frame_count)
-                            duplicate_detected = False
-
-                            for i in range(sample_frames):
-                                cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                ret, frame = cap.read()
-                                if not ret:
-                                    continue
-                                hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-
-                                if hash_value in moderator_removed_hashes and not submission.approved:
-                                    try:
-                                        original_submission_id = video_hashes[hash_value][0]
-                                        original_submission = reddit.submission(id=original_submission_id)
-                                        submission.mod.remove()
-                                        post_comment(submission, original_submission.author.name, original_submission.title,
-                                                   datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                   original_submission.created_utc, "Removed by Moderator", original_submission.permalink)
-                                        print("Duplicate external video frame removed (moderator-removed): ", submission.url)
-                                        duplicate_detected = True
-                                        processed_modqueue_submissions.add(submission.id)
-                                        break
-                                    except Exception:
-                                        pass
-
-                                if hash_value in video_hashes:
-                                    if not submission.approved:
-                                        submission.mod.remove()
-                                        original_id, _ = video_hashes[hash_value]
-                                        original_submission = reddit.submission(id=original_id)
-                                        post_comment(submission, original_submission.author.name, original_submission.title,
-                                                   datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                                   original_submission.created_utc, "Active", original_submission.permalink)
-                                        print("Duplicate external video frame removed: ", submission.url)
-                                        duplicate_detected = True
-                                        processed_modqueue_submissions.add(submission.id)
-                                        break
-
-                            cap.release()
-                            try:
-                                import shutil, os
-                                shutil.rmtree(os.path.dirname(local_clip), ignore_errors=True)
-                            except Exception:
-                                pass
-
-                            if not duplicate_detected and not submission.approved:
-                                submission.mod.approve()
-                                print("Original external video approved (stream): ", submission.url)
-                                processed_modqueue_submissions.add(submission.id)
-
-                            if not duplicate_detected:
-                                local_clip = download_sample_video(submission.url, duration_seconds=5)
-                                if local_clip is not None:
-                                    cap = cv2.VideoCapture(local_clip)
-                                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-                                    sample_frames = min(100, frame_count)
-                                    for i in range(sample_frames):
-                                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * frame_count / sample_frames))
-                                        ret, frame = cap.read()
-                                        if not ret:
-                                            continue
-                                        hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
-                                        if hash_value not in video_hashes:
-                                            video_hashes[hash_value] = (submission.id, submission.created_utc)
-                                    cap.release()
-                                    try:
-                                        import shutil, os
-                                        shutil.rmtree(os.path.dirname(local_clip), ignore_errors=True)
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            handle_exception(e)
-                except Exception as e:
-                    handle_exception(e)
-
-        threading.Thread(target=safe_run, args=(video_modqueue,), daemon=True).start()
-        threading.Thread(target=safe_run, args=(video_stream,), daemon=True).start()
-
-        while True:
-            time.sleep(5)
-
