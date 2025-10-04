@@ -1,7 +1,6 @@
-
 def run_pokemon_duplicate_bot():
     reddit = initialize_reddit()
-    subreddit = reddit.subreddit('PokeLeaks')
+    subreddit = reddit.subreddit('pythonbottest333')
     image_hashes = {}
     orb_descriptors = {}
     moderator_removed_hashes = set()
@@ -302,8 +301,8 @@ def run_pokemon_duplicate_bot():
                     
                     if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                         is_duplicate = process_submission_for_duplicates(submission, context="modqueue")
-                        if is_duplicate:
-                            processed_modqueue_submissions.add(submission.id)
+                        # Always add to processed set so it doesn't get reprocessed in stream
+                        processed_modqueue_submissions.add(submission.id)
 
             except Exception as e:
                 handle_exception(e)
