@@ -1,4 +1,3 @@
-
 def run_pokemon_duplicate_bot():
     reddit = initialize_reddit()
     subreddit = reddit.subreddit('PokeLeaks')
@@ -134,13 +133,13 @@ def run_pokemon_duplicate_bot():
     def check_hash_duplicate(submission, hash_value, new_features):
         """Check if submission is a hash-based duplicate"""
         if hash_value not in image_hashes:
-            return False, None, None, None, None, None, None
+            return False, None, None, None, None, None
         
         original_id, original_time = image_hashes[hash_value]
         
         # Skip if same submission or older
         if submission.id == original_id or submission.created_utc <= original_time:
-            return False, None, None, None, None, None, None
+            return False, None, None, None, None, None
         
         original_submission = reddit.submission(id=original_id)
         original_features = get_cached_ai_features(original_submission.id)
@@ -153,7 +152,7 @@ def run_pokemon_duplicate_bot():
             original_status = "Removed by Moderator" if hash_value in moderator_removed_hashes else "Active"
             return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
         
-        return False, None, None, None, None, None, None
+        return False, None, None, None, None, None
 
     def check_orb_duplicate(submission, descriptors, new_features):
         """Check if submission is an ORB-based duplicate"""
@@ -172,7 +171,7 @@ def run_pokemon_duplicate_bot():
                     
                     return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
         
-        return False, None, None, None, None, None, None
+        return False, None, None, None, None, None
 
     def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink):
         """Remove duplicate and post comment if not approved"""
