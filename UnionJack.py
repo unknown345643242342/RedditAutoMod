@@ -240,27 +240,113 @@ def run_pokemon_duplicate_bot():
             return False
 
     def check_removed_original_posts():
+        """Monitor for immediate removal detection using dual approach"""
+        processed_log_items = set()
+        last_checked = {}
+        
+        # Thread for monitoring mod log (immediate mod removals)
+        def monitor_mod_log():
+            while True:
+                try:
+                    for log_entry in subreddit.mod.stream.log(action='removelink', skip_existing=True):
+                        if log_entry.id in processed_log_items:
+                            continue
+                        
+                        processed_log_items.add(log_entry.id)
+                        removed_submission_id = log_entry.target_fullname.replace('t3_', '')
+                        
+                        # Find the hash for this submission
+                        hash_to_process = None
+                        for hash_value, (submission_id, creation_time) in list(image_hashes.items()):
+                            if submission_id == removed_submission_id:
+                                hash_to_process = hash_value
+                                break
+                        
+                        if hash_to_process and hash_to_process not in moderator_removed_hashes:
+                            moderator_removed_hashes.add(hash_to_process)
+                            print(f"[MOD REMOVE] Submission {removed_submission_id} removed by moderator. Hash kept for future duplicate detection.")
+                        
+                        # Limit processed log items
+                        if len(processed_log_items) > 1000:
+                            processed_log_items.clear()
+                    
+                except Exception as e:
+                    print(f"Error in mod log monitor: {e}")
+                    time.sleep(5)
+        
+        # Start mod log monitor in separate thread
+        threading.Thread(target=monitor_mod_log, daemon=True).start()
+        
+        # Main thread: prioritized check for user deletions
         while True:
             try:
+                current_check_time = time.time()
+                checked_this_cycle = 0
+                
+                # Separate submissions into priority tiers based on age
+                recent_submissions = []  # < 1 hour old
+                medium_submissions = []  # 1-24 hours old
+                old_submissions = []     # > 24 hours old
+                
                 for hash_value, (submission_id, creation_time) in list(image_hashes.items()):
-                    original_submission = reddit.submission(id=submission_id)
-                    original_author = original_submission.author
-                    banned_by_moderator = original_submission.banned_by
-
-                    if banned_by_moderator is not None:
-                        if hash_value not in moderator_removed_hashes:
-                            moderator_removed_hashes.add(hash_value)
-                            print(f"[MOD REMOVE] Original submission {submission_id} removed by a moderator. Hash kept.")
-                    elif original_author is None:
-                        del image_hashes[hash_value]
-                        if submission_id in orb_descriptors:
-                            del orb_descriptors[submission_id]
-                        if submission_id in ai_features:
-                            del ai_features[submission_id]
-                        print(f"[USER REMOVE] Original submission {submission_id} removed by user. Hash deleted.")
+                    # Skip if already marked as mod-removed
+                    if hash_value in moderator_removed_hashes:
+                        continue
+                    
+                    age = current_check_time - creation_time
+                    last_check = last_checked.get(submission_id, 0)
+                    
+                    # Determine check interval based on age
+                    if age < 3600:  # Less than 1 hour old
+                        check_interval = 30  # Check every 30 seconds
+                        if current_check_time - last_check >= check_interval:
+                            recent_submissions.append((hash_value, submission_id))
+                    elif age < 86400:  # 1-24 hours old
+                        check_interval = 300  # Check every 5 minutes
+                        if current_check_time - last_check >= check_interval:
+                            medium_submissions.append((hash_value, submission_id))
+                    else:  # Older than 24 hours
+                        check_interval = 1800  # Check every 30 minutes
+                        if current_check_time - last_check >= check_interval:
+                            old_submissions.append((hash_value, submission_id))
+                
+                # Process in priority order: recent first, then medium, then old
+                all_to_check = recent_submissions + medium_submissions[:20] + old_submissions[:10]
+                
+                for hash_value, submission_id in all_to_check:
+                    try:
+                        original_submission = reddit.submission(id=submission_id)
+                        original_author = original_submission.author
+                        
+                        # Check if user deleted their post
+                        if original_author is None:
+                            if hash_value in image_hashes:
+                                del image_hashes[hash_value]
+                            if submission_id in orb_descriptors:
+                                del orb_descriptors[submission_id]
+                            if submission_id in ai_features:
+                                del ai_features[submission_id]
+                            if submission_id in last_checked:
+                                del last_checked[submission_id]
+                            print(f"[USER DELETE] Submission {submission_id} deleted by user. Hash removed.")
+                        else:
+                            last_checked[submission_id] = current_check_time
+                        
+                        checked_this_cycle += 1
+                        
+                        # Rate limiting: check 10 at a time, then pause
+                        if checked_this_cycle >= 10:
+                            time.sleep(2)
+                            checked_this_cycle = 0
+                        
+                    except Exception as e:
+                        print(f"Error checking submission {submission_id}: {e}")
+                        last_checked[submission_id] = current_check_time
+                
             except Exception as e:
                 handle_exception(e)
-
+            
+            time.sleep(5)  # Short 5-second pause between cycles
     threading.Thread(target=check_removed_original_posts, daemon=True).start()
 
     # --- Initial scan ---
