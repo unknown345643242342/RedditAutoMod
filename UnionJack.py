@@ -1,3 +1,4 @@
+
 def run_pokemon_duplicate_bot():
     reddit = initialize_reddit()
     subreddit = reddit.subreddit('PokeLeaks')
@@ -171,7 +172,7 @@ def run_pokemon_duplicate_bot():
                     
                     return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
         
-        return False, None, None, None, None, None
+        return False, None, None, None, None, None, None
 
     def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink):
         """Remove duplicate and post comment if not approved"""
