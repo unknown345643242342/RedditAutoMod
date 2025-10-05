@@ -34,6 +34,40 @@ def run_pokemon_duplicate_bot():
             print("AI feature extraction error:", e)
             return None
 
+    def has_significant_text(img):
+        """NEW: Fast detection to check if image likely contains text"""
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Check 1: Edge density (text has lots of edges)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / edges.size
+            
+            # Check 2: Horizontal line detection (text forms horizontal lines)
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+            detected_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, horizontal_kernel)
+            horizontal_ratio = np.sum(detected_lines > 0) / detected_lines.size
+            
+            # Check 3: Standard deviation (text regions have high variance)
+            std_dev = np.std(gray)
+            
+            # Check 4: Binary threshold analysis (text creates distinct regions)
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            small_contours = sum(1 for c in contours if 100 < cv2.contourArea(c) < 5000)
+            
+            # Decision logic: likely has text if multiple indicators are positive
+            has_text = (
+                (edge_density > 0.05 and horizontal_ratio > 0.002) or
+                (std_dev > 40 and small_contours > 5) or
+                (edge_density > 0.08)
+            )
+            
+            return has_text
+        except Exception as e:
+            print(f"Text detection error: {e}")
+            return False  # If detection fails, skip OCR
+
     def extract_text_from_image(img):
         """NEW: Extract text using pytesseract with multiple preprocessing strategies"""
         try:
@@ -162,7 +196,12 @@ def run_pokemon_duplicate_bot():
         hash_value = str(imagehash.phash(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))))
         descriptors = get_orb_descriptors_conditional(img)
         features = get_ai_features(img)
-        text = extract_text_from_image(img)  # NEW: Extract text
+        # NEW: Only extract text if image likely contains text
+        if has_significant_text(img):
+            text = extract_text_from_image(img)
+            print("Text detected and extracted")
+        else:
+            text = ""
         return img, hash_value, descriptors, features, text
 
     def get_cached_ai_features(submission_id):
@@ -185,7 +224,11 @@ def run_pokemon_duplicate_bot():
         old_submission = reddit.submission(id=submission_id)
         old_image_data = requests.get(old_submission.url).content
         old_img = cv2.imdecode(np.asarray(bytearray(old_image_data), dtype=np.uint8), cv2.IMREAD_COLOR)
-        old_text = extract_text_from_image(old_img)
+        # NEW: Only extract text if image likely contains text
+        if has_significant_text(old_img):
+            old_text = extract_text_from_image(old_img)
+        else:
+            old_text = ""
         image_text[submission_id] = old_text
         return old_text
 
