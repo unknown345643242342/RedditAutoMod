@@ -58,16 +58,75 @@ def handle_exception(e):
         print(f"Exception encountered: {str(e)}")
 
 # =========================
-# Workers
-def run_pokemon_duplicate_bot():
+# Global storage for all subreddits
+# =========================
+subreddit_data = {}
+subreddit_data_lock = threading.Lock()
+
+# =========================
+# Moderator invite acceptor
+# =========================
+def accept_moderator_invites():
+    """Continuously monitors and accepts moderator invites"""
     reddit = initialize_reddit()
-    subreddit = reddit.subreddit('PokeLeaks')
-    image_hashes = {}
-    orb_descriptors = {}
-    moderator_removed_hashes = set()
-    processed_modqueue_submissions = set()
-    approved_by_moderator = set()
-    ai_features = {}
+    processed_invites = set()
+    
+    while True:
+        try:
+            for invite in reddit.subreddit('mod').moderator.invitations():
+                invite_id = f"{invite.subreddit.display_name}_{invite.id}"
+                
+                if invite_id not in processed_invites:
+                    try:
+                        invite.accept()
+                        subreddit_name = invite.subreddit.display_name
+                        print(f"[INVITE ACCEPTED] Accepted moderator invite for r/{subreddit_name}")
+                        
+                        # Initialize subreddit monitoring
+                        with subreddit_data_lock:
+                            if subreddit_name not in subreddit_data:
+                                subreddit_data[subreddit_name] = {
+                                    'image_hashes': {},
+                                    'orb_descriptors': {},
+                                    'moderator_removed_hashes': set(),
+                                    'processed_modqueue_submissions': set(),
+                                    'approved_by_moderator': set(),
+                                    'ai_features': {}
+                                }
+                                # Start monitoring this subreddit
+                                threading.Thread(
+                                    target=safe_run,
+                                    args=(run_pokemon_duplicate_bot, subreddit_name),
+                                    daemon=True
+                                ).start()
+                                print(f"[STARTED] Monitoring r/{subreddit_name}")
+                        
+                        processed_invites.add(invite_id)
+                    except Exception as e:
+                        print(f"[ERROR] Failed to accept invite for r/{invite.subreddit.display_name}: {e}")
+            
+            time.sleep(30)  # Check for invites every 30 seconds
+            
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(30)
+
+# =========================
+# Workers
+def run_pokemon_duplicate_bot(subreddit_name):
+    reddit = initialize_reddit()
+    subreddit = reddit.subreddit(subreddit_name)
+    
+    # Get this subreddit's data dictionaries
+    with subreddit_data_lock:
+        sub_data = subreddit_data[subreddit_name]
+    
+    image_hashes = sub_data['image_hashes']
+    orb_descriptors = sub_data['orb_descriptors']
+    moderator_removed_hashes = sub_data['moderator_removed_hashes']
+    processed_modqueue_submissions = sub_data['processed_modqueue_submissions']
+    approved_by_moderator = sub_data['approved_by_moderator']
+    ai_features = sub_data['ai_features']
     current_time = int(time.time())
 
     # --- Tiny AI similarity model ---
@@ -91,7 +150,7 @@ def run_pokemon_duplicate_bot():
                 feat = feat / feat.norm(dim=1, keepdim=True)
             return feat
         except Exception as e:
-            print("AI feature extraction error:", e)
+            print(f"[r/{subreddit_name}] AI feature extraction error:", e)
             return None
 
     def is_problematic_image(img, white_threshold=0.7, text_threshold=0.05):
@@ -154,7 +213,7 @@ def run_pokemon_duplicate_bot():
                 )
                 comment = submission.reply(comment_text)
                 comment.mod.distinguish(sticky=True)
-                print("Duplicate removed and comment posted: ", submission.url)
+                print(f"[r/{subreddit_name}] Duplicate removed and comment posted: ", submission.url)
                 return True
             except Exception as e:
                 handle_exception(e)
@@ -206,7 +265,7 @@ def run_pokemon_duplicate_bot():
         original_features = get_cached_ai_features(original_submission.id)
         ai_score = calculate_ai_similarity(new_features, original_features)
         
-        print(f"Hash match detected. AI similarity: {ai_score:.2f}")
+        print(f"[r/{subreddit_name}] Hash match detected. AI similarity: {ai_score:.2f}")
         
         if ai_score > 0.70:
             original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -239,7 +298,7 @@ def run_pokemon_duplicate_bot():
         if not submission.approved:
             submission.mod.remove()
             post_comment(submission, author, title, date, utc, status, permalink)
-            print(f"Duplicate removed by {detection_method}: {submission.url}")
+            print(f"[r/{subreddit_name}] Duplicate removed by {detection_method}: {submission.url}")
         return True
 
     def handle_moderator_removed_repost(submission, hash_value):
@@ -256,7 +315,7 @@ def run_pokemon_duplicate_bot():
                 "Removed by Moderator",
                 original_submission.permalink
             )
-            print("Repost of a moderator-removed image removed: ", submission.url)
+            print(f"[r/{subreddit_name}] Repost of a moderator-removed image removed: ", submission.url)
             return True
         return False
 
@@ -287,7 +346,7 @@ def run_pokemon_duplicate_bot():
             # Not a duplicate - approve if in mod queue and store data
             if context == "modqueue" and not submission.approved:
                 submission.mod.approve()
-                print("Original submission approved: ", submission.url)
+                print(f"[r/{subreddit_name}] Original submission approved: ", submission.url)
             
             if hash_value not in image_hashes:
                 image_hashes[hash_value] = (submission.id, submission.created_utc)
@@ -325,14 +384,14 @@ def run_pokemon_duplicate_bot():
                         
                         if hash_to_process and hash_to_process not in moderator_removed_hashes:
                             moderator_removed_hashes.add(hash_to_process)
-                            print(f"[MOD REMOVE] Submission {removed_submission_id} removed by moderator. Hash kept for future duplicate detection.")
+                            print(f"[r/{subreddit_name}] [MOD REMOVE] Submission {removed_submission_id} removed by moderator. Hash kept for future duplicate detection.")
                         
                         # Limit processed log items
                         if len(processed_log_items) > 1000:
                             processed_log_items.clear()
                     
                 except Exception as e:
-                    print(f"Error in mod log monitor: {e}")
+                    print(f"[r/{subreddit_name}] Error in mod log monitor: {e}")
                     time.sleep(5)
         
         # Start mod log monitor in separate thread
@@ -389,7 +448,7 @@ def run_pokemon_duplicate_bot():
                                 del ai_features[submission_id]
                             if submission_id in last_checked:
                                 del last_checked[submission_id]
-                            print(f"[USER DELETE] Submission {submission_id} deleted by user. Hash removed.")
+                            print(f"[r/{subreddit_name}] [USER DELETE] Submission {submission_id} deleted by user. Hash removed.")
                         else:
                             last_checked[submission_id] = current_check_time
                         
@@ -401,7 +460,7 @@ def run_pokemon_duplicate_bot():
                             checked_this_cycle = 0
                         
                     except Exception as e:
-                        print(f"Error checking submission {submission_id}: {e}")
+                        print(f"[r/{subreddit_name}] Error checking submission {submission_id}: {e}")
                         last_checked[submission_id] = current_check_time
                 
             except Exception as e:
@@ -412,9 +471,10 @@ def run_pokemon_duplicate_bot():
 
     # --- Initial scan ---
     try:
+        print(f"[r/{subreddit_name}] Starting initial index scan...")
         for submission in subreddit.new(limit=300):
             if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                print("Indexing submission (initial scan): ", submission.url)
+                print(f"[r/{subreddit_name}] Indexing submission (initial scan): ", submission.url)
                 try:
                     img, hash_value, descriptors, features = load_and_process_image(submission.url)
                     if hash_value not in image_hashes:
@@ -423,6 +483,7 @@ def run_pokemon_duplicate_bot():
                         ai_features[submission.id] = features
                 except Exception as e:
                     handle_exception(e)
+        print(f"[r/{subreddit_name}] Initial index scan complete.")
     except Exception as e:
         handle_exception(e)
 
@@ -437,10 +498,10 @@ def run_pokemon_duplicate_bot():
                     if not isinstance(submission, praw.models.Submission):
                         continue
                     
-                    print("Scanning Mod Queue: ", submission.url)
+                    print(f"[r/{subreddit_name}] Scanning Mod Queue: ", submission.url)
                     
                     if submission.num_reports > 0:
-                        print("Skipping reported image: ", submission.url)
+                        print(f"[r/{subreddit_name}] Skipping reported image: ", submission.url)
                         image_hashes = {k: v for k, v in image_hashes.items() if v[0] != submission.id}
                         orb_descriptors.pop(submission.id, None)
                         ai_features.pop(submission.id, None)
@@ -466,7 +527,7 @@ def run_pokemon_duplicate_bot():
                     if submission.id in processed_modqueue_submissions:
                         continue
 
-                    print("Scanning new image/post: ", submission.url)
+                    print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
                     
                     if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                         process_submission_for_duplicates(submission, context="stream")
@@ -486,8 +547,21 @@ if __name__ == "__main__":
         t.start()
         threads[name] = t
         print(f"[STARTED] {name}")
-        
-    add_thread('run_pokemon_duplicate_bot_thread', run_pokemon_duplicate_bot)
+    
+    # Start the moderator invite acceptor
+    add_thread('accept_moderator_invites_thread', accept_moderator_invites)
+    
+    # Start monitoring for the initial subreddit (PokeLeaks)
+    with subreddit_data_lock:
+        subreddit_data['PokeLeaks'] = {
+            'image_hashes': {},
+            'orb_descriptors': {},
+            'moderator_removed_hashes': set(),
+            'processed_modqueue_submissions': set(),
+            'approved_by_moderator': set(),
+            'ai_features': {}
+        }
+    add_thread('run_pokemon_duplicate_bot_thread', run_pokemon_duplicate_bot, 'PokeLeaks')
 
     # Keep the main thread alive indefinitely so daemon threads keep running.
     while True:
