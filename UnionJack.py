@@ -1,3 +1,64 @@
+
+import praw
+import prawcore.exceptions
+import requests
+import time
+from datetime import datetime
+import numpy as np
+from PIL import Image
+import imagehash
+import cv2
+import threading
+import traceback
+import pytesseract
+import easyocr
+import openai
+from openai import OpenAI
+from torchvision import transforms
+import torch
+import torchvision.models as models
+import torchvision.transforms as T
+import hashlib
+import difflib as _difflib
+from io import BytesIO
+from datetime import datetime, timezone
+
+# =========================
+# Crash-proof runner
+# =========================
+def safe_run(target, *args, **kwargs):
+    """
+    Keeps a target function running forever.
+    If the function raises, log the error, sleep briefly, and run it again.
+    """
+    while True:
+        try:
+            target(*args, **kwargs)
+        except Exception as e:
+            print(f"[FATAL] {target.__name__} crashed: {e}")
+            traceback.print_exc()
+            time.sleep(5)  # brief cooldown before retrying
+
+# =========================
+# Reddit init + error handler
+# =========================
+def initialize_reddit():
+    return praw.Reddit(
+        client_id='jl-I3OHYH2_VZMC1feoJMQ',
+        client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
+        username='PokeLeakBot3',
+        password='testbot1',
+        user_agent='testbot'
+    )
+
+def handle_exception(e):
+    if isinstance(e, prawcore.exceptions.ResponseException) and getattr(e, "response", None) and e.response.status_code == 429:
+        print("Rate limited by Reddit API. Ignoring error.")
+    else:
+        print(f"Exception encountered: {str(e)}")
+
+# =========================
+# Workers
 def run_pokemon_duplicate_bot():
     reddit = initialize_reddit()
     subreddit = reddit.subreddit('PokeLeaks')
@@ -351,7 +412,7 @@ def run_pokemon_duplicate_bot():
 
     # --- Initial scan ---
     try:
-        for submission in subreddit.new(limit=200):
+        for submission in subreddit.new(limit=300):
             if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                 print("Indexing submission (initial scan): ", submission.url)
                 try:
@@ -413,3 +474,21 @@ def run_pokemon_duplicate_bot():
             current_time = int(time.time())
         except Exception as e:
             handle_exception(e)
+            
+# =========================
+# Main: start threads via safe_run
+# =========================
+if __name__ == "__main__":
+    threads = {}
+
+    def add_thread(name, func, *args, **kwargs):
+        t = threading.Thread(target=safe_run, args=(func,)+args, kwargs=kwargs, daemon=True)
+        t.start()
+        threads[name] = t
+        print(f"[STARTED] {name}")
+        
+    add_thread('run_pokemon_duplicate_bot_thread', run_pokemon_duplicate_bot)
+
+    # Keep the main thread alive indefinitely so daemon threads keep running.
+    while True:
+        time.sleep(30)
