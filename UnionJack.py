@@ -287,6 +287,8 @@ def run_pokemon_duplicate_bot():
                 ai_score = calculate_ai_similarity(new_features, old_features)
                 text_score = text_similarity(new_text, old_text)  # NEW
                 
+                print(f"ORB match detected. AI similarity: {ai_score:.2f}, Text similarity: {text_score:.2f}")
+                
                 # NEW: Accept if either AI or text similarity is high
                 if ai_score > 0.70 or text_score > 0.75:
                     original_submission = reddit.submission(id=old_id)
