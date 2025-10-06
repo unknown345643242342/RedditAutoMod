@@ -1,41 +1,13 @@
 def run_pokemon_duplicate_bot():
     reddit = initialize_reddit()
     subreddit = reddit.subreddit('PokeLeaks')
-    
-    # NEW: Cache file paths
-    CACHE_DIR = "bot_cache"
-    CACHE_FILE = os.path.join(CACHE_DIR, "duplicate_bot_cache.pkl")
-    
-    # NEW: Load from cache or initialize empty
-    if os.path.exists(CACHE_FILE):
-        try:
-            print("Loading cache from disk...")
-            with open(CACHE_FILE, 'rb') as f:
-                cache_data = pickle.load(f)
-                image_hashes = cache_data.get('image_hashes', {})
-                orb_descriptors = cache_data.get('orb_descriptors', {})
-                moderator_removed_hashes = cache_data.get('moderator_removed_hashes', set())
-                ai_features = cache_data.get('ai_features', {})
-                image_text = cache_data.get('image_text', {})
-                print(f"Cache loaded: {len(image_hashes)} hashes, {len(orb_descriptors)} descriptors")
-        except Exception as e:
-            print(f"Cache load failed: {e}. Starting fresh.")
-            image_hashes = {}
-            orb_descriptors = {}
-            moderator_removed_hashes = set()
-            ai_features = {}
-            image_text = {}
-    else:
-        print("No cache found. Starting fresh.")
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        image_hashes = {}
-        orb_descriptors = {}
-        moderator_removed_hashes = set()
-        ai_features = {}
-        image_text = {}
-    
+    image_hashes = {}
+    orb_descriptors = {}
+    moderator_removed_hashes = set()
     processed_modqueue_submissions = set()
     approved_by_moderator = set()
+    ai_features = {}
+    image_text = {}  # NEW: Store extracted text
     current_time = int(time.time())
 
     # --- Tiny AI similarity model ---
@@ -385,27 +357,6 @@ def run_pokemon_duplicate_bot():
             handle_exception(e)
             return False
 
-    # --- NEW: Cache saving function ---
-    def save_cache():
-        """Periodically save cache to disk"""
-        while True:
-            try:
-                time.sleep(300)  # Save every 5 minutes
-                cache_data = {
-                    'image_hashes': image_hashes,
-                    'orb_descriptors': orb_descriptors,
-                    'moderator_removed_hashes': moderator_removed_hashes,
-                    'ai_features': ai_features,
-                    'image_text': image_text
-                }
-                with open(CACHE_FILE, 'wb') as f:
-                    pickle.dump(cache_data, f)
-                print(f"Cache saved: {len(image_hashes)} hashes")
-            except Exception as e:
-                print(f"Cache save error: {e}")
-    
-    threading.Thread(target=save_cache, daemon=True).start()
-
     def check_removed_original_posts():
         """Monitor for immediate removal detection using dual approach"""
         processed_log_items = set()
@@ -518,48 +469,20 @@ def run_pokemon_duplicate_bot():
             time.sleep(5)  # Short 5-second pause between cycles
     threading.Thread(target=check_removed_original_posts, daemon=True).start()
 
-    # --- Initial scan with parallel processing ---
+    # --- Initial scan ---
     try:
-        print("Starting initial scan with parallel processing...")
-        submissions_to_process = []
-        
         for submission in subreddit.new(limit=300):
             if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                # Skip if already in cache
-                if any(v[0] == submission.id for v in image_hashes.values()):
-                    continue
-                submissions_to_process.append(submission)
-        
-        print(f"Found {len(submissions_to_process)} new submissions to process")
-        
-        def process_single_submission(submission):
-            """Helper function for parallel processing"""
-            try:
-                print(f"Indexing: {submission.url}")
-                img, hash_value, descriptors, features, text = load_and_process_image(submission.url)
-                return (submission.id, submission.created_utc, hash_value, descriptors, features, text)
-            except Exception as e:
-                print(f"Error processing {submission.url}: {e}")
-                return None
-        
-        # Process in parallel with ThreadPoolExecutor
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(process_single_submission, sub): sub for sub in submissions_to_process}
-            
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    sub_id, created_utc, hash_value, descriptors, features, text = result
+                print("Indexing submission (initial scan): ", submission.url)
+                try:
+                    img, hash_value, descriptors, features, text = load_and_process_image(submission.url)
                     if hash_value not in image_hashes:
-                        image_hashes[hash_value] = (sub_id, created_utc)
-                        orb_descriptors[sub_id] = descriptors
-                        ai_features[sub_id] = features
-                        image_text[sub_id] = text
-        
-        print(f"Initial scan complete: {len(image_hashes)} images indexed")
-        
+                        image_hashes[hash_value] = (submission.id, submission.created_utc)
+                        orb_descriptors[submission.id] = descriptors
+                        ai_features[submission.id] = features
+                        image_text[submission.id] = text  # NEW
+                except Exception as e:
+                    handle_exception(e)
     except Exception as e:
         handle_exception(e)
 
