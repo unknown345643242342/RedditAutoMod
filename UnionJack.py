@@ -56,12 +56,15 @@ def run_pokemon_duplicate_bot():
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             small_contours = sum(1 for c in contours if 100 < cv2.contourArea(c) < 5000)
             
-            # Decision logic: likely has text if multiple indicators are positive
+            # Decision logic: MUCH MORE LENIENT thresholds
             has_text = (
-                (edge_density > 0.05 and horizontal_ratio > 0.002) or
-                (std_dev > 40 and small_contours > 5) or
-                (edge_density > 0.08)
+                (edge_density > 0.03 and horizontal_ratio > 0.001) or
+                (std_dev > 30 and small_contours > 3) or
+                (edge_density > 0.05) or
+                (small_contours > 8)
             )
+            
+            print(f"[TEXT DETECTION] edge={edge_density:.4f}, h_ratio={horizontal_ratio:.4f}, std={std_dev:.1f}, contours={small_contours} -> {has_text}")
             
             return has_text
         except Exception as e:
@@ -96,7 +99,14 @@ def run_pokemon_duplicate_bot():
             all_text = ' '.join([text1, text2, text3])
             # Clean and normalize
             cleaned_text = ' '.join(all_text.split()).lower()
-            return cleaned_text if len(cleaned_text) > 10 else ""
+            final_text = cleaned_text if len(cleaned_text) > 10 else ""
+            
+            if final_text:
+                print(f"[OCR EXTRACTED] {len(final_text)} chars: {final_text[:100]}...")
+            else:
+                print("[OCR EXTRACTED] No significant text found")
+            
+            return final_text
         except Exception as e:
             print(f"Text extraction error: {e}")
             return ""
@@ -199,7 +209,6 @@ def run_pokemon_duplicate_bot():
         # NEW: Only extract text if image likely contains text
         if has_significant_text(img):
             text = extract_text_from_image(img)
-            print("Text detected and extracted")
         else:
             text = ""
         return img, hash_value, descriptors, features, text
