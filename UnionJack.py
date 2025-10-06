@@ -35,54 +35,80 @@ def run_pokemon_duplicate_bot():
             return None
 
     def has_significant_text(img):
-        """NEW: Fast detection to check if image likely contains text"""
+        """Enhanced detection for social media screenshots"""
         try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
-            # Check 1: Edge density (text has lots of edges)
+            # Check if it's a dark mode screenshot
+            mean_brightness = np.mean(gray)
+            is_dark_mode = mean_brightness < 100
+            
+            # For dark mode, check for bright text
+            if is_dark_mode:
+                bright_pixels = np.sum(gray > 180) / gray.size
+                if bright_pixels > 0.01:  # Even small amount of bright pixels suggests text
+                    return True
+            
+            # Original checks
             edges = cv2.Canny(gray, 50, 150)
             edge_density = np.sum(edges > 0) / edges.size
             
-            # Check 2: Horizontal line detection (text forms horizontal lines)
             horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
             detected_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, horizontal_kernel)
             horizontal_ratio = np.sum(detected_lines > 0) / detected_lines.size
             
-            # Check 3: Standard deviation (text regions have high variance)
-            std_dev = np.std(gray)
-            
-            # Check 4: Binary threshold analysis (text creates distinct regions)
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            small_contours = sum(1 for c in contours if 100 < cv2.contourArea(c) < 5000)
-            
-            # Decision logic: likely has text if multiple indicators are positive
+            # More lenient thresholds for screenshots
             has_text = (
-                (edge_density > 0.05 and horizontal_ratio > 0.002) or
-                (std_dev > 40 and small_contours > 5) or
-                (edge_density > 0.08)
+                (edge_density > 0.03) or  # Lower threshold
+                (horizontal_ratio > 0.001) or  # Lower threshold
+                is_dark_mode  # Assume dark mode screenshots have text
             )
             
             return has_text
         except Exception as e:
             print(f"Text detection error: {e}")
-            return False  # If detection fails, skip OCR
+            return True  # Default to attempting OCR on error
 
     def extract_text_from_image(img):
-        """NEW: Extract text using pytesseract with multiple preprocessing strategies"""
+        """Enhanced text extraction optimized for social media screenshots"""
         try:
-            # Convert to PIL Image
             img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            all_texts = []
             
-            # Strategy 1: Direct extraction
-            text1 = pytesseract.image_to_string(img_pil, config='--psm 6').strip()
+            # Strategy 1: Direct extraction with multiple PSM modes
+            for psm in [6, 11, 3]:  # Block, sparse text, auto
+                text = pytesseract.image_to_string(img_pil, config=f'--psm {psm}').strip()
+                if text:
+                    all_texts.append(text)
             
-            # Strategy 2: Grayscale + threshold for white text on dark background
+            # Strategy 2: Dark mode optimization (white text on black)
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            _, thresh_dark = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
-            text2 = pytesseract.image_to_string(Image.fromarray(thresh_dark), config='--psm 6').strip()
+            mean_brightness = np.mean(gray)
             
-            # Strategy 3: Increase contrast for colored text
+            if mean_brightness < 100:  # Dark background detected
+                # Invert for better OCR
+                inverted = cv2.bitwise_not(gray)
+                text = pytesseract.image_to_string(Image.fromarray(inverted), config='--psm 11').strip()
+                if text:
+                    all_texts.append(text)
+                
+                # Binary threshold for white text
+                _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+                text = pytesseract.image_to_string(Image.fromarray(thresh), config='--psm 11').strip()
+                if text:
+                    all_texts.append(text)
+            
+            # Strategy 3: Upscale low-resolution images
+            h, w = img.shape[:2]
+            if h < 800 or w < 800:
+                scale = 2
+                upscaled = cv2.resize(img, (w*scale, h*scale), interpolation=cv2.INTER_CUBIC)
+                upscaled_pil = Image.fromarray(cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB))
+                text = pytesseract.image_to_string(upscaled_pil, config='--psm 11').strip()
+                if text:
+                    all_texts.append(text)
+            
+            # Strategy 4: Contrast enhancement (for colored text)
             lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -90,13 +116,31 @@ def run_pokemon_duplicate_bot():
             enhanced = cv2.merge([l, a, b])
             enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
             enhanced_pil = Image.fromarray(cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB))
-            text3 = pytesseract.image_to_string(enhanced_pil, config='--psm 6').strip()
+            text = pytesseract.image_to_string(enhanced_pil, config='--psm 11').strip()
+            if text:
+                all_texts.append(text)
             
-            # Combine all extracted text
-            all_text = ' '.join([text1, text2, text3])
-            # Clean and normalize
-            cleaned_text = ' '.join(all_text.split()).lower()
+            # Strategy 5: Adaptive thresholding for varied lighting
+            adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                            cv2.THRESH_BINARY, 11, 2)
+            text = pytesseract.image_to_string(Image.fromarray(adaptive), config='--psm 11').strip()
+            if text:
+                all_texts.append(text)
+            
+            # Combine and deduplicate
+            combined_text = ' '.join(all_texts)
+            # Remove duplicates while preserving order
+            words = []
+            seen = set()
+            for word in combined_text.split():
+                word_lower = word.lower()
+                if word_lower not in seen:
+                    words.append(word)
+                    seen.add(word_lower)
+            
+            cleaned_text = ' '.join(words).lower()
             return cleaned_text if len(cleaned_text) > 10 else ""
+            
         except Exception as e:
             print(f"Text extraction error: {e}")
             return ""
@@ -277,6 +321,8 @@ def run_pokemon_duplicate_bot():
                 
                 ai_score = calculate_ai_similarity(new_features, old_features)
                 text_score = text_similarity(new_text, old_text)  # NEW
+                
+                print(f"ORB match detected. AI similarity: {ai_score:.2f}, Text similarity: {text_score:.2f}")
                 
                 # NEW: Accept if either AI or text similarity is high
                 if ai_score > 0.70 or text_score > 0.75:
