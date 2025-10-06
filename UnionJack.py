@@ -127,18 +127,16 @@ def run_pokemon_duplicate_bot():
             if text:
                 all_texts.append(text)
             
-            # Combine and deduplicate
-            combined_text = ' '.join(all_texts)
-            # Remove duplicates while preserving order
-            words = []
-            seen = set()
-            for word in combined_text.split():
-                word_lower = word.lower()
-                if word_lower not in seen:
-                    words.append(word)
-                    seen.add(word_lower)
+            # Combine and deduplicate EXTRACTIONS, not individual words
+            unique_texts = []
+            seen_texts = set()
+            for text in all_texts:
+                text_normalized = ' '.join(text.lower().split())  # Normalize whitespace
+                if text_normalized and text_normalized not in seen_texts:
+                    unique_texts.append(text_normalized)
+                    seen_texts.add(text_normalized)
             
-            cleaned_text = ' '.join(words).lower()
+            cleaned_text = ' '.join(unique_texts)
             return cleaned_text if len(cleaned_text) > 10 else ""
             
         except Exception as e:
