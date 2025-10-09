@@ -1,32 +1,3 @@
-import praw
-import openai
-import time
-import re
-import random
-import traceback
-import prawcore
-import os
-from datetime import datetime
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from threading import Thread
-from openai import OpenAI
-from dotenv import load_dotenv
-
-# --- LOAD ENVIRONMENT VARIABLES ---
-load_dotenv()
-
-# --- CONFIGURATION ---
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
-
-reddit = praw.Reddit(
-    client_id=os.getenv("REDDIT_CLIENT_ID", "jl-I3OHYH2_VZMC1feoJMQ"),
-    client_secret=os.getenv("REDDIT_CLIENT_SECRET", "TCOIQBXqIskjWEbdH9i5lvoFavAJ1A"),
-    username=os.getenv("REDDIT_USERNAME", "PokeLeakBot3"),
-    password=os.getenv("REDDIT_PASSWORD", "testbot1"),
-    user_agent=os.getenv("REDDIT_USER_AGENT", "testbot")
-)
-
 subreddit_name = "PokeLeaks"
 human_moderators = ["u/Gismo69", "u/vagrantwade", "u/Aether13", "u/Cmholde2"]
 
@@ -81,9 +52,12 @@ def should_auto_remove(comment_text):
         (r'(where|how)\s+(can|do|to)\s+.{0,30}(download|get|find).{0,30}(rom|iso|xci|game|file)', "Piracy request"),
         (r'discord\s*(server|link|invite|channel)', "Discord server request"),
         (r'(join|invite|link).{0,20}discord', "Discord invite request"),
-        (r'\bsex(ual|y|ually)?\b(?!.*pokemon)', "Sexual content (not Pokemon-related)"),
-        (r'\b(porn|nsfw|xxx|nude|naked)\b', "Explicit content"),
+        # Only flag sexual content, not Pokemon-related terms
+        (r'\b(porn|nsfw|xxx|nude|naked|sex)\b(?!.*pokemon)(?!.*breed)', "Explicit sexual content"),
         (r'(politics|political|democrat|republican|liberal|conservative)\b', "Political discussion"),
+        # Only flag personal attacks, not game criticism
+        (r'(fuck|shit).{0,30}(you|u\b|your|ur\b)', "Personal attack with profanity"),
+        (r'you.{0,20}(idiot|stupid|dumb|moron|retard)', "Personal insult"),
     ]
     
     text_lower = comment_text.lower()
@@ -143,34 +117,37 @@ def parse_automod_rules(content):
 def gpt_decision(comment_text, rules_summary):
     """Use GPT to analyze comment with strict rules"""
     
-    prompt = f"""You are a strict Reddit moderator for r/PokeLeaks. Follow these rules EXACTLY in order:
+    prompt = f"""You are a Reddit moderator for r/PokeLeaks. Follow these rules EXACTLY:
 
-AUTOMATIC REMOVAL - NO EXCEPTIONS:
-1. ANY mention of "Khu" or "Riddler Khu" anywhere in comment
-2. Requests for Discord servers, invites, or links
-3. Piracy requests: ROM, ISO, XCI files, game downloads, "where to download"
-4. Sexual or explicit content
-5. Political discussions or inflammatory politics
-6. Personal attacks or harassment directed at specific users
+AUTOMATIC REMOVAL - REMOVE THESE IMMEDIATELY:
+1. ANY mention of "Khu" or "Riddler Khu"
+2. Requests for Discord servers/invites
+3. Piracy: ROM, ISO, XCI files, game downloads
+4. Sexual/explicit content
+5. Political discussions
+6. Personal attacks/harassment DIRECTED AT USERS (e.g., "you're an idiot", "fuck you")
 
-ALLOWED - May approve if civil and on-topic:
-- Passionate opinions about Pokémon games, leaks, or designs
-- Criticism of Game Freak, Nintendo, or game quality
-- Speculation about future Pokémon content
-- Debates about leaker credibility (EXCEPT Khu)
-- Casual profanity used in excitement/humor (NOT directed at people)
-- Respectful disagreements about Pokémon topics
+ALWAYS APPROVE - THESE ARE ALLOWED:
+- Profanity about GAMES/COMPANIES: "this game is shit", "what the fuck is this design", "Game Freak fucked up"
+- Criticism of Game Freak, Nintendo, developers, game quality
+- Excitement: "holy shit this is awesome", "fuck yeah"
+- Frustration about games: "this sucks", "what the hell"
+- ANY profanity NOT directed at other users
 
-COMMENT TO ANALYZE:
+ONLY REMOVE if comment:
+- Attacks another USER directly ("fuck you", "you're stupid")
+- Violates rules 1-6 above
+- Is completely off-topic (not about Pokemon)
+
+COMMENT:
 "{comment_text}"
 
-INSTRUCTIONS:
-1. Check if comment violates ANY automatic removal rule
-2. If it violates a rule, respond: REMOVE: <specific rule number violated>
-3. If it doesn't violate rules and is civil, respond: APPROVE: <brief reason>
-4. When uncertain, choose REMOVE
+CRITICAL: Profanity about games/companies/designs is ALLOWED. Only remove profanity if it attacks another person directly.
 
-RESPOND WITH ONLY ONE LINE - REMOVE or APPROVE:"""
+RESPOND WITH ONE LINE:
+APPROVE: <reason>
+OR
+REMOVE: <rule number>"""
 
     try:
         response = openai_client.chat.completions.create(
@@ -178,14 +155,14 @@ RESPOND WITH ONLY ONE LINE - REMOVE or APPROVE:"""
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a strict moderation assistant. Always prioritize rule violations. When in doubt, REMOVE. Reply with only 'REMOVE: <reason>' or 'APPROVE: <reason>'."
+                    "content": "You are a lenient Reddit moderator. Allow passionate criticism of games and companies. Only remove personal attacks against users, illegal content, or off-topic posts. Profanity about games/companies is ALLOWED."
                 },
                 {
                     "role": "user", 
                     "content": prompt
                 }
             ],
-            temperature=0.2,  # Lower = more consistent
+            temperature=0.3,
             max_tokens=150
         )
         
@@ -371,16 +348,15 @@ def process_comment(comment, approved, removed, rules_summary):
     
     # STEP 7: Take action
     try:
-        # Only approve if BOTH GPT says approve AND similar to approved content
-        # This makes the bot more conservative
-        if decision == "APPROVE" and is_similar:
+        # Trust GPT's decision more - only require similarity as a bonus, not requirement
+        if decision == "APPROVE":
             comment.mod.approve()
-            log_decision(comment.id, comment_author, "APPROVE", explanation, "APPROVED")
-            print("✅ ACTION: APPROVED (GPT + Similarity)")
-        elif decision == "APPROVE" and not is_similar:
-            # GPT wants to approve but no similar precedent - be cautious
-            log_decision(comment.id, comment_author, "APPROVE_HELD", "GPT approved but no similar precedent", "NO_ACTION")
-            print("⏸️ ACTION: HELD (GPT approved but no precedent)")
+            if is_similar:
+                log_decision(comment.id, comment_author, "APPROVE", explanation, "APPROVED (GPT + Similarity)")
+                print("✅ ACTION: APPROVED (GPT + Similarity match)")
+            else:
+                log_decision(comment.id, comment_author, "APPROVE", explanation, "APPROVED (GPT only)")
+                print("✅ ACTION: APPROVED (GPT decision)")
         else:
             log_decision(comment.id, comment_author, "REMOVE", explanation, "KEPT_REMOVED")
             print("🚫 ACTION: KEPT REMOVED")
