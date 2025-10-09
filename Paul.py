@@ -5,44 +5,62 @@ import re
 import random
 import traceback
 import prawcore
+import os
+from datetime import datetime
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from threading import Thread
 from openai import OpenAI
+from dotenv import load_dotenv
 
-# --- CONFIGURATION (kept exactly as you provided) ---
-openai_client = OpenAI(api_key="")
+# --- LOAD ENVIRONMENT VARIABLES ---
+load_dotenv()
+
+# --- CONFIGURATION ---
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 
 reddit = praw.Reddit(
-    client_id='jl-I3OHYH2_VZMC1feoJMQ',
-    client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-    username='PokeLeakBot3',
-    password='testbot1',
-    user_agent='testbot'
+    client_id=os.getenv("REDDIT_CLIENT_ID", "jl-I3OHYH2_VZMC1feoJMQ"),
+    client_secret=os.getenv("REDDIT_CLIENT_SECRET", "TCOIQBXqIskjWEbdH9i5lvoFavAJ1A"),
+    username=os.getenv("REDDIT_USERNAME", "PokeLeakBot3"),
+    password=os.getenv("REDDIT_PASSWORD", "testbot1"),
+    user_agent=os.getenv("REDDIT_USER_AGENT", "testbot")
 )
 
 subreddit_name = "PokeLeaks"
 human_moderators = ["u/Gismo69", "u/vagrantwade", "u/Aether13", "u/Cmholde2"]
 
 # --- BOT DECISIONS LOG ---
-bot_decisions = []  # Store GPT's decisions to compare with human mods
+bot_decisions = []
+
+# --- LOGGING SETUP ---
+def log_decision(comment_id, author, decision, reason, action_taken):
+    """Log all bot decisions for review"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] ID:{comment_id} | Author:{author} | Decision:{decision} | Reason:{reason} | Action:{action_taken}"
+    print(log_entry)
+    
+    # Also write to file for persistence
+    try:
+        with open("bot_decisions.log", "a", encoding="utf-8") as f:
+            f.write(log_entry + "\n")
+    except Exception as e:
+        print(f"⚠️ Failed to write to log file: {e}")
 
 # --- SAFE RUN + BACKOFF ---
 def backoff_sleep(attempt, base=5, cap=120):
-    # Exponential backoff with jitter: min(cap, base * 2^attempt) plus 0-1s jitter
     delay = min(cap, base * (2 ** attempt)) + random.random()
+    print(f"⏳ Backing off for {delay:.1f} seconds (attempt {attempt})")
     time.sleep(delay)
 
 def safe_run(func, *args, **kwargs):
-    """
-    Run a function forever. If it raises, log the error, back off, and retry.
-    This keeps the worker alive even across network/API glitches.
-    """
+    """Run a function forever with retry logic"""
     attempt = 0
     while True:
         try:
             return func(*args, **kwargs)
         except KeyboardInterrupt:
+            print("\n🛑 Keyboard interrupt detected. Shutting down...")
             raise
         except Exception as e:
             attempt += 1
@@ -50,8 +68,35 @@ def safe_run(func, *args, **kwargs):
             traceback.print_exc()
             backoff_sleep(attempt)
 
-# --- DOXXING/LINK FILTER (unchanged) ---
+# --- AUTOMATIC REMOVAL TRIGGERS ---
+def should_auto_remove(comment_text):
+    """Check for hard violation triggers before GPT analysis"""
+    
+    # Critical triggers that bypass GPT
+    critical_triggers = [
+        (r'\bkhu\b', "Mention of Khu (banned leaker)"),
+        (r'riddler\s*khu', "Mention of Riddler Khu"),
+        (r'\b(rom|iso|xci)\s*(file|download)?', "Piracy file format request"),
+        (r'\b(pirat(e|ed|ing)|crack(ed)?|torrent)\b', "Piracy terminology"),
+        (r'(where|how)\s+(can|do|to)\s+.{0,30}(download|get|find).{0,30}(rom|iso|xci|game|file)', "Piracy request"),
+        (r'discord\s*(server|link|invite|channel)', "Discord server request"),
+        (r'(join|invite|link).{0,20}discord', "Discord invite request"),
+        (r'\bsex(ual|y|ually)?\b(?!.*pokemon)', "Sexual content (not Pokemon-related)"),
+        (r'\b(porn|nsfw|xxx|nude|naked)\b', "Explicit content"),
+        (r'(politics|political|democrat|republican|liberal|conservative)\b', "Political discussion"),
+    ]
+    
+    text_lower = comment_text.lower()
+    
+    for pattern, reason in critical_triggers:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True, reason
+    
+    return False, ""
+
+# --- DOXXING/LINK FILTER ---
 def is_doxxing_or_link(comment_text):
+    """Check for links and personal information"""
     patterns = [
         r'(https?://\S+|www\.\S+)',  # Normal URLs
         r'(hxxps?|https?|ftp|www|\[dot\]|\(dot\)|dot)\s*[:\.]?\s*//?',  # Obfuscated URLs
@@ -60,253 +105,351 @@ def is_doxxing_or_link(comment_text):
         r'(pastebin\.com|mega\.nz|anonfiles\.com|drive\.google\.com|dropbox\.com)',
         r'(discord\.gg|discordapp\.com|discord\.com)',
         r'(t\.me|telegram\.me)',
-        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-        r'\b(\+?\d{1,3}[\s.-]?)?(\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4}\b',
-        r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Email
+        r'\b(\+?\d{1,3}[\s.-]?)?(\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4}\b',  # Phone
+        r'\b(?:\d{1,3}\.){3}\d{1,3}\b',  # IP address
         r'u\/[A-Za-z0-9_-]{3,20}',  # Reddit usernames
         r'r\/[A-Za-z0-9_]{3,21}'    # Subreddit mentions
     ]
+    
     for pattern in patterns:
         if re.search(pattern, comment_text, re.IGNORECASE):
-            return True, "Comment contains a link, username, or subreddit mention"
+            return True, f"Contains link/personal info (pattern matched: {pattern[:30]}...)"
+    
     return False, ""
 
-# --- FETCH AUTOMOD RULES (unchanged) ---
+# --- FETCH AUTOMOD RULES ---
 def fetch_automod_rules():
+    """Fetch AutoModerator configuration from wiki"""
     try:
         wiki_page = reddit.subreddit(subreddit_name).wiki["config/automoderator"]
         return wiki_page.content_md
     except Exception as e:
-        print("❌ Error fetching AutoMod rules:", e)
+        print(f"❌ Error fetching AutoMod rules: {e}")
         return ""
 
 def parse_automod_rules(content):
+    """Parse AutoMod rules into structured format"""
     rules = {}
     rule_pattern = r"Rule #(\d+):\s*(.*?)(?=\nRule #|\Z)"
     matches = re.findall(rule_pattern, content, re.DOTALL)
+    
     for number, text in matches:
         rules[int(number)] = text.strip()
+    
     return rules
 
-# --- GPT AI MODERATOR (kept, with try/except) ---
+# --- GPT AI MODERATOR (IMPROVED) ---
 def gpt_decision(comment_text, rules_summary):
-    prompt = f"""
-You are a Reddit moderator and conversation analysis AI bot for the r/PokeLeaks subreddit that mimics a human moderator. Analyze the following comment using common Reddit rules, community standards, and AutoMod rules below. Pay special attention to the tone and context, especially when profanity or strong and sexual language is used, No links, mentions of other users or subreddits, or any form of exploiting information that can lead to the doxxing of third parties should be allowed such as emails, IP addresses, phone numbers should be approved and stay removed. Comments asking about piracy, pirated or copyrighted files, pirated files such as ROMs, ISOs, XCI files or any form of files should not be approved and stay removed. As a moderator you do not condone any form of illegal pirated material or copyrighted file sharing or distribution. Any mention of Riddler Khu or Khu should stay removed and not be approved. Do not approve comments asking about discord servers or discord links 
-Your job is to classify Reddit comment threads based on tone, civility, and relevance to Pokémon leaks.
+    """Use GPT to analyze comment with strict rules"""
+    
+    prompt = f"""You are a strict Reddit moderator for r/PokeLeaks. Follow these rules EXACTLY in order:
 
-    Safe discussions include:
-    - Civil debates over leaks, designs, leakers' credibility or light hearted and friendly jokes
-    - Respectful speculation or disagreements
-    - Analytical conversations about gameplay, consoles, or future content
+AUTOMATIC REMOVAL - NO EXCEPTIONS:
+1. ANY mention of "Khu" or "Riddler Khu" anywhere in comment
+2. Requests for Discord servers, invites, or links
+3. Piracy requests: ROM, ISO, XCI files, game downloads, "where to download"
+4. Sexual or explicit content
+5. Political discussions or inflammatory politics
+6. Personal attacks or harassment directed at specific users
 
-    Flagged discussions include:
-    - Arguments that involve insults, sarcasm, personal attacks
-    - Off-topic political, religious, or inflammatory comments
-    - Escalating back-and-forth replies with increasing hostility
-    - Asking about discord link or servers, pirated files such as xci, rom or iso media
+ALLOWED - May approve if civil and on-topic:
+- Passionate opinions about Pokémon games, leaks, or designs
+- Criticism of Game Freak, Nintendo, or game quality
+- Speculation about future Pokémon content
+- Debates about leaker credibility (EXCEPT Khu)
+- Casual profanity used in excitement/humor (NOT directed at people)
+- Respectful disagreements about Pokémon topics
 
-    Always allow critical or passionate Pokémon discussion if the tone stays civil and respectful.
+COMMENT TO ANALYZE:
+"{comment_text}"
 
-Comment:
-\"\"\"{comment_text}\"\"\"
+INSTRUCTIONS:
+1. Check if comment violates ANY automatic removal rule
+2. If it violates a rule, respond: REMOVE: <specific rule number violated>
+3. If it doesn't violate rules and is civil, respond: APPROVE: <brief reason>
+4. When uncertain, choose REMOVE
 
-AutoMod Rules:
-{rules_summary}
+RESPOND WITH ONLY ONE LINE - REMOVE or APPROVE:"""
 
-Please determine if the language is inappropriate or if it can be approved based on context. If the profanity is used in excitement, humor, positivity, lightheartedness, indicate this in your reasoning. Ignore any comments that involve Khu — those should stay removed. Remove any comments that contain sexual or political themes.
-
-Reply only with either:
-APPROVE: <short reason>
-REMOVE: <short reason>
-"""
     try:
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-            max_tokens=100
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are a strict moderation assistant. Always prioritize rule violations. When in doubt, REMOVE. Reply with only 'REMOVE: <reason>' or 'APPROVE: <reason>'."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            temperature=0.2,  # Lower = more consistent
+            max_tokens=150
         )
+        
         content = response.choices[0].message.content.strip()
-        print("🧠 GPT Response:", content)
-
-        if content.upper().startswith("REMOVE"):
+        print(f"🧠 GPT Response: {content}")
+        
+        # Strict parsing - look for keywords
+        content_upper = content.upper()
+        
+        if "REMOVE" in content_upper or "DENY" in content_upper:
             return "REMOVE", content
-        elif content.upper().startswith("APPROVE"):
+        elif "APPROVE" in content_upper or "ALLOW" in content_upper:
             return "APPROVE", content
         else:
-            return "NEUTRAL", content
-
+            # Default to REMOVE if response is unclear
+            return "REMOVE", f"Unclear GPT response (defaulting to remove): {content}"
+            
     except Exception as e:
-        print("❌ GPT Error:", e)
-        return "NEUTRAL", str(e)
+        print(f"❌ GPT Error: {e}")
+        # On error, default to REMOVE for safety
+        return "REMOVE", f"GPT API error - removing for safety: {str(e)}"
 
-# --- SIMILARITY ANALYSIS (unchanged) ---
+# --- SIMILARITY ANALYSIS ---
 def analyze_similarity(comment, approved, removed, result_holder):
+    """Analyze comment similarity to previously moderated comments"""
     try:
         all_comments = approved + removed
         if not all_comments:
             result_holder["similar"] = False
             return
+        
         texts = [comment.body] + [c.body for c in all_comments]
-        tfidf = TfidfVectorizer(stop_words='english')
+        tfidf = TfidfVectorizer(stop_words='english', max_features=1000)
         tfidf_matrix = tfidf.fit_transform(texts)
+        
         sim_score = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).max()
         result_holder["similar"] = sim_score > 0.5
         result_holder["similarity_score"] = sim_score
+        
     except Exception as e:
-        print("❌ Similarity analysis failed:", e)
+        print(f"❌ Similarity analysis failed: {e}")
         result_holder["similar"] = False
 
-# --- LEARNING FROM MOD LOGS (unchanged) ---
+# --- LEARNING FROM MOD LOGS ---
 def learn_from_mods(subreddit):
+    """Learn from human moderator actions (OPTIMIZED)"""
     approved = []
     removed = []
-    print("📘 Learning from mod logs...")
-    for log in subreddit.mod.log(limit=100000, action="approvecomment"):
-        try:
-            approved.append(reddit.comment(log.target_fullname.split("_")[1]))
-        except Exception:
-            continue
-    for log in subreddit.mod.log(limit=100000, action="removecomment"):
-        try:
-            removed.append(reddit.comment(log.target_fullname.split("_")[1]))
-        except Exception:
-            continue
-    print(f"✅ Learned {len(approved)} approved and {len(removed)} removed comments.")
+    
+    print("📘 Learning from recent mod logs...")
+    
+    # REDUCED from 100000 to 1000 for performance
+    try:
+        for log in subreddit.mod.log(limit=1000, action="approvecomment"):
+            try:
+                comment = reddit.comment(log.target_fullname.split("_")[1])
+                approved.append(comment)
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ Error fetching approved comments: {e}")
+    
+    try:
+        for log in subreddit.mod.log(limit=1000, action="removecomment"):
+            try:
+                comment = reddit.comment(log.target_fullname.split("_")[1])
+                removed.append(comment)
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ Error fetching removed comments: {e}")
+    
+    print(f"✅ Learned from {len(approved)} approved and {len(removed)} removed comments.")
     return approved, removed
 
 def was_removed_by_automod(comment):
+    """Check if comment was removed by AutoModerator (OPTIMIZED)"""
     try:
-        logs = list(comment.subreddit.mod.log(limit=100000, action="removecomment"))
+        # REDUCED from 100000 to 50 - only check recent logs
+        logs = list(comment.subreddit.mod.log(limit=50, action="removecomment"))
+        
         for log in logs:
             if log.target_fullname == comment.fullname:
                 if isinstance(log.mod, praw.models.Redditor) and log.mod.name.lower() == "automoderator":
                     print("📛 Removed by AutoMod confirmed.")
                     return True
+                    
     except Exception as e:
-        print("⚠️ Could not check mod log:", e)
+        print(f"⚠️ Could not check mod log: {e}")
+    
     return False
 
-# --- STORE BOT DECISIONS (unchanged) ---
+# --- STORE BOT DECISIONS ---
 def store_bot_decision(comment, decision, explanation, human_action):
+    """Store bot decision for later analysis"""
     bot_decisions.append({
         "comment_id": comment.id,
+        "timestamp": datetime.now().isoformat(),
         "bot_decision": decision,
         "bot_reason": explanation,
         "human_action": human_action
     })
 
-# --- PROCESS A SINGLE COMMENT (wrapped by safe_run when threaded) ---
+# --- PROCESS A SINGLE COMMENT ---
 def process_comment(comment, approved, removed, rules_summary):
-    # Guard: sometimes stream returns deleted/removed objects that error if touched
+    """Process a single comment with all checks"""
+    
+    # Guard: Check if comment is accessible
     try:
-        _ = comment.body  # touch to force a fetch
+        comment_body = comment.body
+        comment_author = getattr(comment.author, 'name', '[deleted]')
     except Exception as e:
-        print("⚠️ Skipping comment (unavailable):", e)
+        print(f"⚠️ Skipping comment (unavailable): {e}")
         return
-
+    
+    # Only process AutoMod-removed comments
     if not was_removed_by_automod(comment):
         return
-
-    print(f"\n🗨️ Processing Comment: {comment.id} by {getattr(comment.author, 'name', '[deleted]')}")
-    print(f"    Body: {comment.body}")
-
-    # Doxxing/link check
-    is_doxxing, reason = is_doxxing_or_link(comment.body)
+    
+    print(f"\n{'='*60}")
+    print(f"🗨️ Processing Comment ID: {comment.id}")
+    print(f"👤 Author: {comment_author}")
+    print(f"📝 Body: {comment_body[:200]}{'...' if len(comment_body) > 200 else ''}")
+    print(f"{'='*60}")
+    
+    # STEP 1: Check for hard violations (auto-remove triggers)
+    should_remove, remove_reason = should_auto_remove(comment_body)
+    if should_remove:
+        try:
+            comment.mod.remove()
+            log_decision(comment.id, comment_author, "AUTO_REMOVE", remove_reason, "REMOVED")
+            print(f"❌ AUTO-REMOVED: {remove_reason}")
+        except Exception as e:
+            print(f"❌ Failed to remove (auto-trigger): {e}")
+        return
+    
+    # STEP 2: Check for doxxing/links
+    is_doxxing, doxx_reason = is_doxxing_or_link(comment_body)
     if is_doxxing:
         try:
             comment.mod.remove()
-            print(f"❌ Auto-Removed (Link/Doxxing): {reason}")
+            log_decision(comment.id, comment_author, "DOXXING_LINK", doxx_reason, "REMOVED")
+            print(f"❌ REMOVED (Link/Doxxing): {doxx_reason}")
         except Exception as e:
-            print("❌ Failed to remove (doxxing):", e)
+            print(f"❌ Failed to remove (doxxing): {e}")
         return
-
-    # Similarity in parallel
+    
+    # STEP 3: Run similarity analysis in parallel
     result_holder = {}
-    sim_thread = Thread(target=analyze_similarity, args=(comment, approved, removed, result_holder), daemon=True)
+    sim_thread = Thread(
+        target=analyze_similarity, 
+        args=(comment, approved, removed, result_holder), 
+        daemon=True
+    )
     sim_thread.start()
-
-    # GPT decision
-    decision, explanation = gpt_decision(comment.body, rules_summary)
+    
+    # STEP 4: Get GPT decision
+    decision, explanation = gpt_decision(comment_body, rules_summary)
     result_holder["gpt_decision"] = decision
     result_holder["gpt_reason"] = explanation
-
-    sim_thread.join()
+    
+    # Wait for similarity analysis
+    sim_thread.join(timeout=5)  # Don't wait forever
     is_similar = result_holder.get("similar", False)
-
-    print(f"🔎 Similar to human-approved: {'✅ Yes' if is_similar else '❌ No'}")
-    print(f"🤖 GPT Decision: {decision} — {explanation}")
-
-    # Human mod check (best effort, don't crash)
+    similarity_score = result_holder.get("similarity_score", 0)
+    
+    print(f"🔎 Similarity Score: {similarity_score:.3f} - {'✅ Similar' if is_similar else '❌ Not similar'}")
+    print(f"🤖 GPT Decision: {decision}")
+    print(f"💭 GPT Reasoning: {explanation}")
+    
+    # STEP 5: Check for human moderator action
     human_action = None
     try:
-        for log in comment.subreddit.mod.log(limit=100):
+        for log in comment.subreddit.mod.log(limit=50):
             if log.target_fullname == comment.fullname:
                 human_action = log.action
                 break
     except Exception as e:
-        print("⚠️ Could not fetch recent mod log for comment:", e)
-
+        print(f"⚠️ Could not fetch mod log: {e}")
+    
+    # STEP 6: Store decision for analysis
     store_bot_decision(comment, decision, explanation, human_action)
-
+    
+    # STEP 7: Take action
     try:
-        if decision == "APPROVE" or is_similar:
+        # Only approve if BOTH GPT says approve AND similar to approved content
+        # This makes the bot more conservative
+        if decision == "APPROVE" and is_similar:
             comment.mod.approve()
-            print("✅ Action: Approved")
+            log_decision(comment.id, comment_author, "APPROVE", explanation, "APPROVED")
+            print("✅ ACTION: APPROVED (GPT + Similarity)")
+        elif decision == "APPROVE" and not is_similar:
+            # GPT wants to approve but no similar precedent - be cautious
+            log_decision(comment.id, comment_author, "APPROVE_HELD", "GPT approved but no similar precedent", "NO_ACTION")
+            print("⏸️ ACTION: HELD (GPT approved but no precedent)")
         else:
-            print("⏳ Action: No action taken")
+            log_decision(comment.id, comment_author, "REMOVE", explanation, "KEPT_REMOVED")
+            print("🚫 ACTION: KEPT REMOVED")
+            
     except prawcore.exceptions.TooManyRequests as e:
-        print("⏳ Rate limited on approve(); backing off:", e)
-        time.sleep(30)
+        print(f"⏳ Rate limited: {e}")
+        time.sleep(60)
     except Exception as e:
-        print("❌ Failed to apply action:", e)
+        print(f"❌ Failed to apply action: {e}")
+    
+    print(f"{'='*60}\n")
 
-# --- MAIN MONITOR FUNCTION (now resilient) ---
+# --- MAIN MONITOR FUNCTION ---
 def monitor_comments():
+    """Main monitoring loop"""
     sub = reddit.subreddit(subreddit_name)
-
-    # Learn from logs & rules (with retry if network flakes)
+    
+    print("🚀 Starting Reddit Moderation Bot")
+    print(f"📍 Subreddit: r/{subreddit_name}")
+    print(f"🤖 Bot: {reddit.user.me()}")
+    print()
+    
+    # Learn from logs & rules
     approved, removed = safe_run(learn_from_mods, sub)
     rules_raw = safe_run(fetch_automod_rules)
     parsed_rules = parse_automod_rules(rules_raw)
-    rules_summary = "\n".join([f"Rule #{k}: {v}" for k, v in parsed_rules.items()])
-
-    print("🚀 Monitoring AutoMod-removed comments in real-time...")
-
+    rules_summary = "\n".join([f"Rule #{k}: {v[:100]}..." for k, v in parsed_rules.items()])
+    
+    print("\n🎯 Bot is now monitoring for AutoMod-removed comments...")
+    print("📋 Check 'bot_decisions.log' for detailed decision logs\n")
+    
     attempt = 0
     while True:
         try:
-            # reddit.stream.* generators can raise; keep them in a small try so we can resume
             for comment in sub.stream.comments(skip_existing=True):
-                # Each comment handled in its own safe thread so a failure never kills the stream
+                # Process each comment in a separate thread with safe_run
                 t = Thread(
                     target=safe_run,
                     args=(process_comment, comment, approved, removed, rules_summary),
                     daemon=True
                 )
                 t.start()
-                time.sleep(1)  # throttle to be gentle with API
-            # If the for-loop exits naturally, reset attempt
+                time.sleep(2)  # Throttle API calls
+                
+            # If loop exits naturally, reset attempt counter
             attempt = 0
+            
         except (prawcore.exceptions.ServerError,
                 prawcore.exceptions.ResponseException,
                 prawcore.exceptions.RequestException,
                 prawcore.exceptions.TooManyRequests) as e:
             attempt += 1
-            print(f"⚠️ Stream error ({e.__class__.__name__}): {e}. Will resume.")
+            print(f"⚠️ Stream error ({e.__class__.__name__}): {e}")
             backoff_sleep(attempt, base=3, cap=90)
-            continue
+            
         except Exception as e:
             attempt += 1
             print(f"❌ Unexpected stream error: {e}")
             traceback.print_exc()
             backoff_sleep(attempt, base=5, cap=120)
-            continue
 
+# --- MAIN ENTRY POINT ---
 def main():
-    # Run the monitor under safe_run so even top-level crashes get retried
-    safe_run(monitor_comments)
+    """Run the bot with safe_run wrapper"""
+    try:
+        safe_run(monitor_comments)
+    except KeyboardInterrupt:
+        print("\n👋 Bot shutting down gracefully...")
+        print(f"📊 Processed {len(bot_decisions)} comments this session")
 
 if __name__ == "__main__":
     main()
-
