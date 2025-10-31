@@ -509,6 +509,10 @@ async def run_pokemon_duplicate_bot():
                         if not isinstance(submission, asyncpraw.models.Submission):
                             continue
                         
+                        # Skip if already processed by stream worker
+                        if submission.id in data['processed_modqueue_submissions']:
+                            continue
+                        
                         print(f"[r/{subreddit_name}] Scanning Mod Queue: ", submission.url)
                         
                         if submission.num_reports > 0:
@@ -539,6 +543,8 @@ async def run_pokemon_duplicate_bot():
                             
                             if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                                 await process_submission_for_duplicates(submission, context="stream")
+                                # Mark as processed to prevent double-processing
+                                data['processed_modqueue_submissions'].add(submission.id)
 
                     data['current_time'] = int(time.time())
                 except Exception as e:
