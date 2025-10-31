@@ -523,23 +523,3 @@ def run_pokemon_duplicate_bot():
     print("Monitoring for mod invites...")
     while True:
         time.sleep(10)  # Keep alive
-        
-# =========================
-# Main: start threads via safe_run
-# =========================
-if __name__ == "__main__":
-    threads = {}
-
-    def add_thread(name, func, *args, **kwargs):
-        t = threading.Thread(target=safe_run, args=(func,)+args, kwargs=kwargs, daemon=True)
-        t.start()
-        threads[name] = t
-        print(f"[STARTED] {name}")
-
-    add_thread('run_pokemon_duplicate_bot_thread', run_pokemon_duplicate_bot)
-
-    # Keep the main thread alive indefinitely so daemon threads keep running.
-    while True:
-        time.sleep(30)
-
-
