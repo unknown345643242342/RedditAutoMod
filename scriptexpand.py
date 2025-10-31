@@ -443,33 +443,33 @@ def run_pokemon_duplicate_bot():
 
     # --- Accept invites and setup subreddits ---
     def check_for_invites():
-    """Check for moderator invites and automatically accept them"""
-    while True:
-        try:
-            # Check unread messages for mod invites
-            for message in reddit.inbox.unread(limit=None):
-                if "invitation to moderate" in message.subject.lower():
-                    subreddit_name = message.subreddit.display_name
-                    print(f"\n*** Found mod invite for r/{subreddit_name} ***")
-                    try:
-                        message.subreddit.mod.accept_invite()
-                        print(f"✅ Accepted mod invite for r/{subreddit_name}")
+        """Check for moderator invites and automatically accept them"""
+        while True:
+            try:
+                # Check unread messages for mod invites
+                for message in reddit.inbox.unread(limit=None):
+                    if "invitation to moderate" in message.subject.lower():
+                        subreddit_name = message.subreddit.display_name
+                        print(f"\n*** Found mod invite for r/{subreddit_name} ***")
+                        try:
+                            message.subreddit.mod.accept_invite()
+                            print(f"✅ Accepted mod invite for r/{subreddit_name}")
+                            threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
+                        except Exception as e:
+                            print(f"Error accepting invite for r/{subreddit_name}: {e}")
+                        message.mark_read()
+            
+                # Also check for already accepted subreddits
+                for subreddit in reddit.user.moderator_subreddits(limit=None):
+                    subreddit_name = subreddit.display_name
+                    if subreddit_name not in subreddit_data:
+                        print(f"\n*** Already moderating r/{subreddit_name}, setting up bot ***")
                         threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
-                    except Exception as e:
-                        print(f"Error accepting invite for r/{subreddit_name}: {e}")
-                    message.mark_read()
             
-            # Also check for already accepted subreddits
-            for subreddit in reddit.user.moderator_subreddits(limit=None):
-                subreddit_name = subreddit.display_name
-                if subreddit_name not in subreddit_data:
-                    print(f"\n*** Already moderating r/{subreddit_name}, setting up bot ***")
-                    threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
-            
-        except Exception as e:
-            print(f"Error checking for invites: {e}")
+            except Exception as e:
+                print(f"Error checking for invites: {e}")
         
-        time.sleep(60)
+            time.sleep(60)
     
     # Start the invite checker
     threading.Thread(target=check_for_invites, daemon=True).start()
