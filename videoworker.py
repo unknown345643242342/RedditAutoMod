@@ -87,17 +87,54 @@ def run_pokemon_duplicate_bot():
             return len(matches) / min(len(desc1), len(desc2))
 
         # --- NEW: Video processing functions ---
-        def download_video(url):
+        def get_reddit_video_url(submission):
+            """Extract actual video URL from Reddit submission"""
+            try:
+                # Check if it's a Reddit-hosted video
+                if hasattr(submission, 'is_video') and submission.is_video:
+                    if hasattr(submission, 'media') and submission.media:
+                        reddit_video = submission.media.get('reddit_video', {})
+                        if 'fallback_url' in reddit_video:
+                            return reddit_video['fallback_url']
+                
+                # Check crosspost
+                if hasattr(submission, 'crosspost_parent_list') and submission.crosspost_parent_list:
+                    parent = submission.crosspost_parent_list[0]
+                    if 'media' in parent and parent['media']:
+                        reddit_video = parent['media'].get('reddit_video', {})
+                        if 'fallback_url' in reddit_video:
+                            return reddit_video['fallback_url']
+                
+                # For v.redd.it URLs, try to construct the fallback URL
+                if 'v.redd.it' in submission.url:
+                    video_id = submission.url.split('/')[-1]
+                    return f"https://v.redd.it/{video_id}/DASH_720.mp4"
+                
+                return submission.url
+            except Exception as e:
+                print(f"[r/{subreddit_name}] Error getting Reddit video URL:", e)
+                return submission.url
+
+        def download_video(url, submission=None):
             """Download video to temporary file"""
             try:
-                response = requests.get(url, timeout=30, stream=True)
+                # If submission provided and it's a v.redd.it link, get proper URL
+                if submission and 'v.redd.it' in url:
+                    url = get_reddit_video_url(submission)
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                response = requests.get(url, timeout=30, stream=True, headers=headers)
+                response.raise_for_status()
+                
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
                 for chunk in response.iter_content(chunk_size=8192):
                     temp_file.write(chunk)
                 temp_file.close()
                 return temp_file.name
             except Exception as e:
-                print(f"[r/{subreddit_name}] Video download error:", e)
+                print(f"[r/{subreddit_name}] Video download error: {e}")
                 return None
 
         def extract_video_frames(video_path, num_frames=10):
@@ -181,9 +218,9 @@ def run_pokemon_duplicate_bot():
             
             return False
 
-        def load_and_process_video(url):
+        def load_and_process_video(url, submission=None):
             """Download video, extract frames, compute hash and features"""
-            video_path = download_video(url)
+            video_path = download_video(url, submission)
             if not video_path:
                 return None, None, None
             
@@ -271,7 +308,7 @@ def run_pokemon_duplicate_bot():
                 if submission_id in data['video_features']:
                     return data['video_features'][submission_id]
                 
-                video_hash, video_features, _ = load_and_process_video(old_submission.url)
+                video_hash, video_features, _ = load_and_process_video(old_submission.url, old_submission)
                 if video_features is not None:
                     data['video_features'][submission_id] = video_features
                     return video_features
@@ -405,7 +442,7 @@ def run_pokemon_duplicate_bot():
         def process_video_submission(submission, context="stream"):
             """Process video submissions for duplicates"""
             try:
-                video_hash, video_features, frames = load_and_process_video(submission.url)
+                video_hash, video_features, frames = load_and_process_video(submission.url, submission)
                 
                 if video_hash is None or video_features is None:
                     print(f"[r/{subreddit_name}] Failed to process video: {submission.url}")
@@ -627,7 +664,7 @@ def run_pokemon_duplicate_bot():
                     elif is_video_url(submission.url):
                         print(f"[r/{subreddit_name}] Indexing video (initial scan): ", submission.url)
                         try:
-                            video_hash, video_features, _ = load_and_process_video(submission.url)
+                            video_hash, video_features, _ = load_and_process_video(submission.url, submission)
                             if video_hash and video_hash not in data['video_hashes']:
                                 data['video_hashes'][video_hash] = (submission.id, submission.created_utc)
                                 data['video_features'][submission.id] = video_features
