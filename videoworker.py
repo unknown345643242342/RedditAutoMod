@@ -370,9 +370,21 @@ def run_pokemon_duplicate_bot():
             """Check if video submission is a hash-based duplicate"""
             matched_hash = None
             for stored_hash in data['video_hashes'].keys():
-                if video_hash == stored_hash or (imagehash.hex_to_hash(video_hash) - imagehash.hex_to_hash(stored_hash)) <= 5:
-                    matched_hash = stored_hash
-                    break
+                try:
+                    # Convert string hashes to ImageHash objects for comparison
+                    hash1 = imagehash.hex_to_hash(video_hash)
+                    hash2 = imagehash.hex_to_hash(stored_hash)
+                    hash_diff = hash1 - hash2
+                    
+                    if video_hash == stored_hash or hash_diff <= 5:
+                        matched_hash = stored_hash
+                        break
+                except Exception as e:
+                    print(f"[r/{subreddit_name}] Hash comparison error: {e}")
+                    # Fall back to exact string match
+                    if video_hash == stored_hash:
+                        matched_hash = stored_hash
+                        break
             
             if matched_hash is None:
                 return False, None, None, None, None, None, None
