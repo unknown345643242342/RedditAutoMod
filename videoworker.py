@@ -14,14 +14,12 @@ def run_pokemon_duplicate_bot():
         data = {
             'subreddit': subreddit,
             'image_hashes': {},
-            'video_hashes': {},  # NEW: For video perceptual hashes
-            'video_features': {},  # NEW: For video AI features
             'orb_descriptors': {},
             'moderator_removed_hashes': set(),
-            'moderator_removed_video_hashes': set(),  # NEW: Track removed videos
             'processed_modqueue_submissions': set(),
             'approved_by_moderator': set(),
             'ai_features': {},
+            'repost_history': {},  # Track repost attempts: hash -> list of (author, title, date, utc, permalink)
             'current_time': int(time.time())
         }
         
@@ -86,208 +84,6 @@ def run_pokemon_duplicate_bot():
             matches = bf_matcher.match(desc1, desc2)
             return len(matches) / min(len(desc1), len(desc2))
 
-        # --- NEW: Video processing functions ---
-        def get_reddit_video_url(submission):
-            """Extract actual video URL from Reddit submission"""
-            try:
-                # Check if it's a Reddit-hosted video
-                if hasattr(submission, 'is_video') and submission.is_video:
-                    if hasattr(submission, 'media') and submission.media:
-                        reddit_video = submission.media.get('reddit_video', {})
-                        if 'fallback_url' in reddit_video:
-                            return reddit_video['fallback_url']
-                
-                # Check crosspost
-                if hasattr(submission, 'crosspost_parent_list') and submission.crosspost_parent_list:
-                    parent = submission.crosspost_parent_list[0]
-                    if 'media' in parent and parent['media']:
-                        reddit_video = parent['media'].get('reddit_video', {})
-                        if 'fallback_url' in reddit_video:
-                            return reddit_video['fallback_url']
-                
-                # For v.redd.it URLs, try to construct the fallback URL
-                if 'v.redd.it' in submission.url:
-                    video_id = submission.url.split('/')[-1]
-                    return f"https://v.redd.it/{video_id}/DASH_720.mp4"
-                
-                return submission.url
-            except Exception as e:
-                print(f"[r/{subreddit_name}] Error getting Reddit video URL:", e)
-                return submission.url
-
-        def download_video(url, submission=None):
-            """Download video to temporary file"""
-            try:
-                # Handle YouTube videos specially
-                if is_youtube_url(url):
-                    return download_youtube_video(url)
-                
-                # If submission provided and it's a v.redd.it link, get proper URL
-                if submission and 'v.redd.it' in url:
-                    url = get_reddit_video_url(submission)
-                
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-                response = requests.get(url, timeout=30, stream=True, headers=headers)
-                response.raise_for_status()
-                
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                for chunk in response.iter_content(chunk_size=8192):
-                    temp_file.write(chunk)
-                temp_file.close()
-                return temp_file.name
-            except Exception as e:
-                print(f"[r/{subreddit_name}] Video download error: {e}")
-                return None
-
-        def extract_video_frames(video_path, num_frames=10):
-            """Extract evenly spaced frames from video"""
-            try:
-                cap = cv2.VideoCapture(video_path)
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                
-                if total_frames == 0:
-                    cap.release()
-                    return []
-                
-                # Extract evenly spaced frames
-                frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-                frames = []
-                
-                for idx in frame_indices:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, frame = cap.read()
-                    if ret:
-                        frames.append(frame)
-                
-                cap.release()
-                return frames
-            except Exception as e:
-                print(f"[r/{subreddit_name}] Frame extraction error:", e)
-                return []
-
-        def get_video_hash(frames):
-            """Compute average perceptual hash from video frames"""
-            if not frames:
-                return None
-            
-            try:
-                hashes = []
-                for frame in frames:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    frame_hash = imagehash.phash(Image.fromarray(gray))
-                    hashes.append(frame_hash)
-                
-                # Convert hashes to binary arrays and average them
-                hash_arrays = [np.array(h.hash).flatten() for h in hashes]
-                avg_hash_array = np.mean(hash_arrays, axis=0)
-                
-                # Convert back to binary (threshold at 0.5)
-                avg_hash_binary = (avg_hash_array > 0.5).astype(bool)
-                
-                # Reshape to 8x8 for phash and create ImageHash object
-                avg_hash_reshaped = avg_hash_binary.reshape((8, 8))
-                avg_hash = imagehash.ImageHash(avg_hash_reshaped)
-                
-                return str(avg_hash)
-            except Exception as e:
-                print(f"[r/{subreddit_name}] Video hash error:", e)
-                return None
-
-        def get_video_features(frames):
-            """Extract AI features from video frames and average them"""
-            if not frames:
-                return None
-            
-            try:
-                features_list = []
-                for frame in frames:
-                    feat = get_ai_features(frame)
-                    if feat is not None:
-                        features_list.append(feat)
-                
-                if not features_list:
-                    return None
-                
-                # Average features
-                avg_features = torch.mean(torch.stack(features_list), dim=0)
-                return avg_features
-            except Exception as e:
-                print(f"[r/{subreddit_name}] Video features error:", e)
-                return None
-
-        def is_video_url(url):
-            """Check if URL is a video"""
-            video_extensions = ('.mp4', '.webm', '.mov', '.avi', '.gifv')
-            video_domains = ('v.redd.it', 'i.imgur.com/.*\.gifv', 'gfycat.com', 'redgifs.com', 
-                           'youtube.com', 'youtu.be', 'vimeo.com', 'streamable.com')
-            
-            if url.endswith(video_extensions):
-                return True
-            
-            for domain in video_domains:
-                if domain in url:
-                    return True
-            
-            return False
-
-        def is_youtube_url(url):
-            """Check if URL is a YouTube link"""
-            return 'youtube.com' in url or 'youtu.be' in url
-
-        def download_youtube_video(url):
-            """Download YouTube video using yt-dlp"""
-            try:
-                import yt_dlp
-                
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                temp_file.close()
-                
-                ydl_opts = {
-                    'format': 'worst[ext=mp4]/worst',  # Get lowest quality for speed
-                    'outtmpl': temp_file.name,
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extract_flat': False,
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                
-                return temp_file.name
-            except ImportError:
-                print(f"[r/{subreddit_name}] yt-dlp not installed. Cannot process YouTube videos.")
-                print("Install with: pip install yt-dlp")
-                return None
-            except Exception as e:
-                print(f"[r/{subreddit_name}] YouTube download error: {e}")
-                return None
-
-        def load_and_process_video(url, submission=None):
-            """Download video, extract frames, compute hash and features"""
-            video_path = download_video(url, submission)
-            if not video_path:
-                return None, None, None
-            
-            try:
-                frames = extract_video_frames(video_path, num_frames=10)
-                if not frames:
-                    return None, None, None
-                
-                video_hash = get_video_hash(frames)
-                video_features = get_video_features(frames)
-                
-                print(f"[r/{subreddit_name}] Generated video hash: {video_hash}")
-                
-                return video_hash, video_features, frames
-            finally:
-                # Clean up temp file
-                try:
-                    os.unlink(video_path)
-                except:
-                    pass
-
         def format_age(utc_timestamp):
             now = datetime.now(timezone.utc)
             created = datetime.fromtimestamp(utc_timestamp, tz=timezone.utc)
@@ -305,10 +101,23 @@ def run_pokemon_duplicate_bot():
             else:
                 return f"{seconds} second{'s' if seconds != 1 else ''} ago"
 
-        def post_comment(submission, original_post_author, original_post_title, original_post_date, original_post_utc, original_status, original_post_permalink):
+        def post_comment(submission, original_post_author, original_post_title, original_post_date, original_post_utc, original_status, original_post_permalink, matched_hash):
             max_retries = 3
             retries = 0
             age_text = format_age(original_post_utc)
+            
+            # Build repost history section
+            repost_section = ""
+            if matched_hash in data['repost_history'] and len(data['repost_history'][matched_hash]) > 0:
+                repost_section = "\n\n---\n\n**Previous repost attempts:**\n\n"
+                repost_section += "| Author | Title | Date | Age |\n"
+                repost_section += "|:------:|:-----:|:----:|:---:|\n"
+                
+                for repost in data['repost_history'][matched_hash]:
+                    repost_author, repost_title, repost_date, repost_utc, repost_permalink = repost
+                    repost_age = format_age(repost_utc)
+                    repost_section += f"| {repost_author} | [{repost_title}]({repost_permalink}) | {repost_date} | {repost_age} |\n"
+            
             while retries < max_retries:
                 try:
                     comment_text = (
@@ -316,16 +125,32 @@ def run_pokemon_duplicate_bot():
                         "| Original Author | Title | Date | Age | Status |\n"
                         "|:---------------:|:-----:|:----:|:---:|:------:|\n"
                         f"| {original_post_author} | [{original_post_title}]({original_post_permalink}) | {original_post_date} | {age_text} | {original_status} |"
+                        f"{repost_section}"
                     )
                     comment = submission.reply(comment_text)
                     comment.mod.distinguish(sticky=True)
-                    print(f"[r/{subreddit_name}] Duplicate removed and comment posted: ", submission.url)
+                    comment.mod.lock()
+                    print(f"[r/{subreddit_name}] Duplicate removed and comment posted (locked): ", submission.url)
                     return True
                 except Exception as e:
                     handle_exception(e)
                     retries += 1
                     time.sleep(1)
             return False
+
+        def add_to_repost_history(matched_hash, submission):
+            """Add current submission to repost history"""
+            if matched_hash not in data['repost_history']:
+                data['repost_history'][matched_hash] = []
+            
+            repost_data = (
+                submission.author.name,
+                submission.title,
+                datetime.utcfromtimestamp(submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
+                submission.created_utc,
+                submission.permalink
+            )
+            data['repost_history'][matched_hash].append(repost_data)
 
         def load_and_process_image(url):
             """Load image from URL and compute hash, descriptors, AI features"""
@@ -348,19 +173,6 @@ def run_pokemon_duplicate_bot():
                 return data['ai_features'][submission_id]
             
             old_submission = reddit.submission(id=submission_id)
-            
-            # Check if it's a video
-            if is_video_url(old_submission.url):
-                if submission_id in data['video_features']:
-                    return data['video_features'][submission_id]
-                
-                video_hash, video_features, _ = load_and_process_video(old_submission.url, old_submission)
-                if video_features is not None:
-                    data['video_features'][submission_id] = video_features
-                    return video_features
-                return None
-            
-            # It's an image
             old_image_data = requests.get(old_submission.url, timeout=10).content
             old_img = cv2.imdecode(np.asarray(bytearray(old_image_data), dtype=np.uint8), cv2.IMREAD_COLOR)
             old_features = get_ai_features(old_img)
@@ -382,12 +194,12 @@ def run_pokemon_duplicate_bot():
                     break
             
             if matched_hash is None:
-                return False, None, None, None, None, None, None
+                return False, None, None, None, None, None, None, None
             
             original_id, original_time = data['image_hashes'][matched_hash]
             
             if submission.id == original_id or submission.created_utc <= original_time:
-                return False, None, None, None, None, None, None
+                return False, None, None, None, None, None, None, None
             
             original_submission = reddit.submission(id=original_id)
             original_features = get_cached_ai_features(original_submission.id)
@@ -399,51 +211,9 @@ def run_pokemon_duplicate_bot():
             if ai_score > 0.50:
                 original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
                 original_status = "Removed by Moderator" if matched_hash in data['moderator_removed_hashes'] else "Active"
-                return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
+                return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink, matched_hash
             
-            return False, None, None, None, None, None, None
-
-        def check_video_hash_duplicate(submission, video_hash, new_features):
-            """Check if video submission is a hash-based duplicate"""
-            matched_hash = None
-            for stored_hash in data['video_hashes'].keys():
-                try:
-                    # Convert string hashes to ImageHash objects for comparison
-                    hash1 = imagehash.hex_to_hash(video_hash)
-                    hash2 = imagehash.hex_to_hash(stored_hash)
-                    hash_diff = hash1 - hash2
-                    
-                    if video_hash == stored_hash or hash_diff <= 5:
-                        matched_hash = stored_hash
-                        break
-                except Exception as e:
-                    print(f"[r/{subreddit_name}] Hash comparison error: {e}")
-                    # Fall back to exact string match
-                    if video_hash == stored_hash:
-                        matched_hash = stored_hash
-                        break
-            
-            if matched_hash is None:
-                return False, None, None, None, None, None, None
-            
-            original_id, original_time = data['video_hashes'][matched_hash]
-            
-            if submission.id == original_id or submission.created_utc <= original_time:
-                return False, None, None, None, None, None, None
-            
-            original_submission = reddit.submission(id=original_id)
-            original_features = get_cached_ai_features(original_submission.id)
-            
-            ai_score = calculate_ai_similarity(new_features, original_features)
-            
-            print(f"[r/{subreddit_name}] Video hash match detected. AI similarity: {ai_score:.2f}")
-            
-            if ai_score > 0.65:  # Slightly higher threshold for videos
-                original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
-                original_status = "Removed by Moderator" if matched_hash in data['moderator_removed_video_hashes'] else "Active"
-                return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
-            
-            return False, None, None, None, None, None, None
+            return False, None, None, None, None, None, None, None
 
         def check_orb_duplicate(submission, descriptors, new_features):
             """Check if submission is an ORB-based duplicate"""
@@ -463,26 +233,25 @@ def run_pokemon_duplicate_bot():
                         old_hash = next((h for h, v in data['image_hashes'].items() if v[0] == old_id), None)
                         original_status = "Removed by Moderator" if old_hash and old_hash in data['moderator_removed_hashes'] else "Active"
                         
-                        return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
+                        return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink, old_hash
             
-            return False, None, None, None, None, None, None
+            return False, None, None, None, None, None, None, None
 
-        def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink):
+        def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink, matched_hash):
             """Remove duplicate and post comment if not approved"""
             if not submission.approved:
+                add_to_repost_history(matched_hash, submission)
                 submission.mod.remove()
-                post_comment(submission, author, title, date, utc, status, permalink)
+                post_comment(submission, author, title, date, utc, status, permalink, matched_hash)
                 print(f"[r/{subreddit_name}] Duplicate removed by {detection_method}: {submission.url}")
             return True
 
-        def handle_moderator_removed_repost(submission, hash_value, is_video=False):
-            """Handle reposts of moderator-removed images/videos"""
-            removed_set = data['moderator_removed_video_hashes'] if is_video else data['moderator_removed_hashes']
-            hash_dict = data['video_hashes'] if is_video else data['image_hashes']
-            
-            if hash_value in removed_set and not submission.approved:
+        def handle_moderator_removed_repost(submission, hash_value):
+            """Handle reposts of moderator-removed images"""
+            if hash_value in data['moderator_removed_hashes'] and not submission.approved:
+                add_to_repost_history(hash_value, submission)
                 submission.mod.remove()
-                original_submission = reddit.submission(id=hash_dict[hash_value][0])
+                original_submission = reddit.submission(id=data['image_hashes'][hash_value][0])
                 post_comment(
                     submission,
                     original_submission.author.name,
@@ -490,73 +259,33 @@ def run_pokemon_duplicate_bot():
                     datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
                     original_submission.created_utc,
                     "Removed by Moderator",
-                    original_submission.permalink
+                    original_submission.permalink,
+                    hash_value
                 )
-                media_type = "video" if is_video else "image"
-                print(f"[r/{subreddit_name}] Repost of a moderator-removed {media_type} removed: ", submission.url)
+                print(f"[r/{subreddit_name}] Repost of a moderator-removed image removed: ", submission.url)
                 return True
             return False
-
-        def process_video_submission(submission, context="stream"):
-            """Process video submissions for duplicates"""
-            try:
-                video_hash, video_features, frames = load_and_process_video(submission.url, submission)
-                
-                if video_hash is None or video_features is None:
-                    print(f"[r/{subreddit_name}] Failed to process video: {submission.url}")
-                    return False
-                
-                data['video_features'][submission.id] = video_features
-                
-                if handle_moderator_removed_repost(submission, video_hash, is_video=True):
-                    return True
-                
-                is_duplicate, author, title, date, utc, status, permalink = check_video_hash_duplicate(
-                    submission, video_hash, video_features
-                )
-                if is_duplicate:
-                    return handle_duplicate(submission, True, "video hash + AI", author, title, date, utc, status, permalink)
-                
-                if video_hash not in data['video_hashes']:
-                    data['video_hashes'][video_hash] = (submission.id, submission.created_utc)
-                    data['video_features'][submission.id] = video_features
-                    print(f"[r/{subreddit_name}] Stored new original video: {submission.url}")
-                
-                if context == "modqueue" and not submission.approved:
-                    submission.mod.approve()
-                    print(f"[r/{subreddit_name}] Original video submission approved: ", submission.url)
-                
-                return False
-                
-            except Exception as e:
-                handle_exception(e)
-                return False
 
         def process_submission_for_duplicates(submission, context="stream"):
             """Main duplicate detection logic - works for both mod queue and stream"""
             try:
-                # Check if it's a video
-                if is_video_url(submission.url):
-                    return process_video_submission(submission, context)
-                
-                # Otherwise process as image
                 img, hash_value, descriptors, new_features = load_and_process_image(submission.url)
                 data['ai_features'][submission.id] = new_features
                 
                 if handle_moderator_removed_repost(submission, hash_value):
                     return True
                 
-                is_duplicate, author, title, date, utc, status, permalink = check_hash_duplicate(
+                is_duplicate, author, title, date, utc, status, permalink, matched_hash = check_hash_duplicate(
                     submission, hash_value, new_features
                 )
                 if is_duplicate:
-                    return handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink)
+                    return handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink, matched_hash)
                 
-                is_duplicate, author, title, date, utc, status, permalink = check_orb_duplicate(
+                is_duplicate, author, title, date, utc, status, permalink, matched_hash = check_orb_duplicate(
                     submission, descriptors, new_features
                 )
                 if is_duplicate:
-                    return handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink)
+                    return handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink, matched_hash)
                 
                 if hash_value not in data['image_hashes']:
                     data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
@@ -589,7 +318,6 @@ def run_pokemon_duplicate_bot():
                             processed_log_items.add(log_entry.id)
                             removed_submission_id = log_entry.target_fullname.replace('t3_', '')
                             
-                            # Check image hashes
                             hash_to_process = None
                             for hash_value, (submission_id, creation_time) in list(data['image_hashes'].items()):
                                 if submission_id == removed_submission_id:
@@ -598,18 +326,7 @@ def run_pokemon_duplicate_bot():
                             
                             if hash_to_process and hash_to_process not in data['moderator_removed_hashes']:
                                 data['moderator_removed_hashes'].add(hash_to_process)
-                                print(f"[r/{subreddit_name}] [MOD REMOVE] Image {removed_submission_id} removed by moderator.")
-                            
-                            # Check video hashes
-                            video_hash_to_process = None
-                            for hash_value, (submission_id, creation_time) in list(data['video_hashes'].items()):
-                                if submission_id == removed_submission_id:
-                                    video_hash_to_process = hash_value
-                                    break
-                            
-                            if video_hash_to_process and video_hash_to_process not in data['moderator_removed_video_hashes']:
-                                data['moderator_removed_video_hashes'].add(video_hash_to_process)
-                                print(f"[r/{subreddit_name}] [MOD REMOVE] Video {removed_submission_id} removed by moderator.")
+                                print(f"[r/{subreddit_name}] [MOD REMOVE] Submission {removed_submission_id} removed by moderator. Hash kept for future duplicate detection.")
                             
                             if len(processed_log_items) > 1000:
                                 processed_log_items.clear()
@@ -625,63 +342,49 @@ def run_pokemon_duplicate_bot():
                     current_check_time = time.time()
                     checked_this_cycle = 0
                     
-                    # Check both images and videos
-                    all_items = []
+                    recent_submissions = []
+                    medium_submissions = []
+                    old_submissions = []
                     
                     for hash_value, (submission_id, creation_time) in list(data['image_hashes'].items()):
-                        if hash_value not in data['moderator_removed_hashes']:
-                            all_items.append(('image', hash_value, submission_id, creation_time))
-                    
-                    for hash_value, (submission_id, creation_time) in list(data['video_hashes'].items()):
-                        if hash_value not in data['moderator_removed_video_hashes']:
-                            all_items.append(('video', hash_value, submission_id, creation_time))
-                    
-                    recent_items = []
-                    medium_items = []
-                    old_items = []
-                    
-                    for item_type, hash_value, submission_id, creation_time in all_items:
+                        if hash_value in data['moderator_removed_hashes']:
+                            continue
+                        
                         age = current_check_time - creation_time
                         last_check = last_checked.get(submission_id, 0)
                         
                         if age < 3600:
                             check_interval = 30
                             if current_check_time - last_check >= check_interval:
-                                recent_items.append((item_type, hash_value, submission_id))
+                                recent_submissions.append((hash_value, submission_id))
                         elif age < 86400:
                             check_interval = 300
                             if current_check_time - last_check >= check_interval:
-                                medium_items.append((item_type, hash_value, submission_id))
+                                medium_submissions.append((hash_value, submission_id))
                         else:
                             check_interval = 1800
                             if current_check_time - last_check >= check_interval:
-                                old_items.append((item_type, hash_value, submission_id))
+                                old_submissions.append((hash_value, submission_id))
                     
-                    all_to_check = recent_items + medium_items[:20] + old_items[:10]
+                    all_to_check = recent_submissions + medium_submissions[:20] + old_submissions[:10]
                     
-                    for item_type, hash_value, submission_id in all_to_check:
+                    for hash_value, submission_id in all_to_check:
                         try:
                             original_submission = reddit.submission(id=submission_id)
                             original_author = original_submission.author
                             
                             if original_author is None:
-                                # Clean up deleted submission
-                                if item_type == 'image':
-                                    if hash_value in data['image_hashes']:
-                                        del data['image_hashes'][hash_value]
-                                    if submission_id in data['orb_descriptors']:
-                                        del data['orb_descriptors'][submission_id]
-                                    if submission_id in data['ai_features']:
-                                        del data['ai_features'][submission_id]
-                                else:  # video
-                                    if hash_value in data['video_hashes']:
-                                        del data['video_hashes'][hash_value]
-                                    if submission_id in data['video_features']:
-                                        del data['video_features'][submission_id]
-                                
+                                if hash_value in data['image_hashes']:
+                                    del data['image_hashes'][hash_value]
+                                if submission_id in data['orb_descriptors']:
+                                    del data['orb_descriptors'][submission_id]
+                                if submission_id in data['ai_features']:
+                                    del data['ai_features'][submission_id]
                                 if submission_id in last_checked:
                                     del last_checked[submission_id]
-                                print(f"[r/{subreddit_name}] [USER DELETE] {item_type.capitalize()} {submission_id} deleted by user.")
+                                if hash_value in data['repost_history']:
+                                    del data['repost_history'][hash_value]
+                                print(f"[r/{subreddit_name}] [USER DELETE] Submission {submission_id} deleted by user. Hash removed.")
                             else:
                                 last_checked[submission_id] = current_check_time
                             
@@ -706,32 +409,20 @@ def run_pokemon_duplicate_bot():
         print(f"[r/{subreddit_name}] Starting initial scan...")
         try:
             for submission in subreddit.new(limit=300):
-                if isinstance(submission, praw.models.Submission):
-                    # Check for images
-                    if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                        print(f"[r/{subreddit_name}] Indexing image (initial scan): ", submission.url)
-                        try:
-                            img, hash_value, descriptors, features = load_and_process_image(submission.url)
-                            if hash_value not in data['image_hashes']:
-                                data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
-                                data['orb_descriptors'][submission.id] = descriptors
-                                data['ai_features'][submission.id] = features
-                        except Exception as e:
-                            handle_exception(e)
-                    # Check for videos
-                    elif is_video_url(submission.url):
-                        print(f"[r/{subreddit_name}] Indexing video (initial scan): ", submission.url)
-                        try:
-                            video_hash, video_features, _ = load_and_process_video(submission.url, submission)
-                            if video_hash and video_hash not in data['video_hashes']:
-                                data['video_hashes'][video_hash] = (submission.id, submission.created_utc)
-                                data['video_features'][submission.id] = video_features
-                        except Exception as e:
-                            handle_exception(e)
+                if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                    print(f"[r/{subreddit_name}] Indexing submission (initial scan): ", submission.url)
+                    try:
+                        img, hash_value, descriptors, features = load_and_process_image(submission.url)
+                        if hash_value not in data['image_hashes']:
+                            data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
+                            data['orb_descriptors'][submission.id] = descriptors
+                            data['ai_features'][submission.id] = features
+                    except Exception as e:
+                        handle_exception(e)
         except Exception as e:
             handle_exception(e)
         
-        print(f"[r/{subreddit_name}] Initial scan complete. Indexed {len(data['image_hashes'])} images and {len(data['video_hashes'])} videos.")
+        print(f"[r/{subreddit_name}] Initial scan complete. Indexed {len(data['image_hashes'])} images.")
 
         # --- Mod Queue worker ---
         def modqueue_worker():
@@ -746,21 +437,13 @@ def run_pokemon_duplicate_bot():
                         print(f"[r/{subreddit_name}] Scanning Mod Queue: ", submission.url)
                         
                         if submission.num_reports > 0:
-                            print(f"[r/{subreddit_name}] Skipping reported submission: ", submission.url)
-                            # Clean up from tracking
+                            print(f"[r/{subreddit_name}] Skipping reported image: ", submission.url)
                             data['image_hashes'] = {k: v for k, v in data['image_hashes'].items() if v[0] != submission.id}
-                            data['video_hashes'] = {k: v for k, v in data['video_hashes'].items() if v[0] != submission.id}
                             data['orb_descriptors'].pop(submission.id, None)
                             data['ai_features'].pop(submission.id, None)
-                            data['video_features'].pop(submission.id, None)
                             continue
                         
-                        # Process images
                         if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                            is_duplicate = process_submission_for_duplicates(submission, context="modqueue")
-                            data['processed_modqueue_submissions'].add(submission.id)
-                        # Process videos
-                        elif is_video_url(submission.url):
                             is_duplicate = process_submission_for_duplicates(submission, context="modqueue")
                             data['processed_modqueue_submissions'].add(submission.id)
 
@@ -779,13 +462,9 @@ def run_pokemon_duplicate_bot():
                             if submission.id in data['processed_modqueue_submissions']:
                                 continue
 
-                            print(f"[r/{subreddit_name}] Scanning new submission: ", submission.url)
+                            print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
                             
-                            # Process images
                             if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                                process_submission_for_duplicates(submission, context="stream")
-                            # Process videos
-                            elif is_video_url(submission.url):
                                 process_submission_for_duplicates(submission, context="stream")
 
                     data['current_time'] = int(time.time())
@@ -833,6 +512,5 @@ def run_pokemon_duplicate_bot():
     # Keep main thread alive
     print("=== Multi-subreddit duplicate bot started ===")
     print("Monitoring for mod invites...")
-    print("Now supporting both images and videos!")
     while True:
         time.sleep(3600)  # Keep alive
