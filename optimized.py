@@ -1,13 +1,13 @@
-import praw
+import asyncpraw
 import prawcore.exceptions
-import requests
+import aiohttp
 import time
 from datetime import datetime
 import numpy as np
 from PIL import Image
 import imagehash
 import cv2
-import threading
+import asyncio
 import traceback
 import pytesseract
 import openai
@@ -23,24 +23,24 @@ from datetime import datetime, timezone
 # =========================
 # Crash-proof runner
 # =========================
-def safe_run(target, *args, **kwargs):
+async def safe_run(target, *args, **kwargs):
     """
-    Keeps a target function running forever.
+    Keeps a target async function running forever.
     If the function raises, log the error, sleep briefly, and run it again.
     """
     while True:
         try:
-            target(*args, **kwargs)
+            await target(*args, **kwargs)
         except Exception as e:
             print(f"[FATAL] {target.__name__} crashed: {e}")
             traceback.print_exc()
-            time.sleep(10)  # brief cooldown before retrying
+            await asyncio.sleep(10)  # brief cooldown before retrying
 
 # =========================
 # Reddit init + error handler
 # =========================
-def initialize_reddit():
-    return praw.Reddit(
+async def initialize_reddit():
+    return asyncpraw.Reddit(
         client_id='jl-I3OHYH2_VZMC1feoJMQ',
         client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
         username='PokeLeakBot3',
@@ -55,27 +55,27 @@ def handle_exception(e):
 # =========================
 # Workers
 # =========================
-def monitor_reported_posts():
-    reddit = initialize_reddit()
-    subreddit = reddit.subreddit("PokeLeaks")
+async def monitor_reported_posts():
+    reddit = await initialize_reddit()
+    subreddit = await reddit.subreddit("PokeLeaks")
     while True:
         try:
-            for post in subreddit.mod.reports():
+            async for post in subreddit.mod.reports():
                 # If already approved previously, re-approve (idempotent)
                 if getattr(post, "approved", False):
-                    post.mod.approve()
+                    await post.mod.approve()
                     print(f"Post {post.id} has been approved again")
         except Exception as e:
             handle_exception(e)
-            time.sleep(60)
+            await asyncio.sleep(60)
 
-def handle_modqueue_items():
-    reddit = initialize_reddit()
+async def handle_modqueue_items():
+    reddit = await initialize_reddit()
     timers = {}
 
     while True:
         try:
-            for item in reddit.subreddit('PokeLeaks').mod.modqueue():
+            async for item in reddit.subreddit('PokeLeaks').mod.modqueue():
                 if getattr(item, "num_reports", 0) == 1 and item.id not in timers:
                     created_time = getattr(item, "created_utc", time.time())
                     timers[item.id] = time.time()
@@ -86,7 +86,7 @@ def handle_modqueue_items():
                     time_diff = time.time() - start_time
                     if time_diff >= 3600:
                         try:
-                            item.mod.approve()
+                            await item.mod.approve()
                             print(f"Approved post {item.id} with one report")
                             del timers[item.id]
                         except prawcore.exceptions.ServerError as se:
@@ -103,16 +103,16 @@ def handle_modqueue_items():
                             print(f"Time remaining for post {item.id}: {time_remaining} seconds")
         except Exception as e:
             handle_exception(e)
-            time.sleep(60)
+            await asyncio.sleep(60)
 
-def handle_spoiler_status():
-    reddit = initialize_reddit()
-    subreddit = reddit.subreddit('PokeLeaks')
+async def handle_spoiler_status():
+    reddit = await initialize_reddit()
+    subreddit = await reddit.subreddit('PokeLeaks')
     previous_spoiler_status = {}
 
     while True:
         try:
-            for submission in subreddit.new():
+            async for submission in subreddit.new():
                 if submission.id not in previous_spoiler_status:
                     previous_spoiler_status[submission.id] = submission.spoiler
                     continue
@@ -120,7 +120,10 @@ def handle_spoiler_status():
                 if previous_spoiler_status[submission.id] != submission.spoiler:
                     # Check if the change was made by a moderator
                     try:
-                        is_moderator = submission.author in subreddit.moderator()
+                        moderators = []
+                        async for mod in subreddit.moderator():
+                            moderators.append(mod)
+                        is_moderator = submission.author in moderators
                     except Exception:
                         is_moderator = False  # be safe if something weird happens
 
@@ -128,7 +131,7 @@ def handle_spoiler_status():
                         if not is_moderator:
                             try:
                                 print(f'Post {submission.id} unmarked as spoiler by non-mod. Re-marking.')
-                                submission.mod.spoiler()
+                                await submission.mod.spoiler()
                             except prawcore.exceptions.ServerError as se:
                                 handle_exception(se)
                         else:
@@ -136,11 +139,11 @@ def handle_spoiler_status():
                     previous_spoiler_status[submission.id] = submission.spoiler
         except Exception as e:
             handle_exception(e)
-            time.sleep(30)
+            await asyncio.sleep(30)
 
-def handle_user_reports_and_removal():
-    reddit = initialize_reddit()
-    subreddit = reddit.subreddit("PokeLeaks")
+async def handle_user_reports_and_removal():
+    reddit = await initialize_reddit()
+    subreddit = await reddit.subreddit("PokeLeaks")
     thresholds = {
         'No Linking to Downloadable Content in Posts or Comments': 1,
         'No ROMs, ISOs, or Game Files Sharing or Requests': 1,
@@ -149,42 +152,42 @@ def handle_user_reports_and_removal():
 
     while True:
         try:
-            for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
-                if isinstance(comment, praw.models.Comment) and getattr(comment, "user_reports", None):
+            async for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+                if isinstance(comment, asyncpraw.models.Comment) and getattr(comment, "user_reports", None):
                     reason = comment.user_reports[0][0]
                     count = comment.user_reports[0][1]
                     if reason in thresholds and count >= thresholds[reason]:
                         try:
-                            comment.mod.remove()
+                            await comment.mod.remove()
                             print(f'Comment "{comment.body}" removed due to {count} reports for reason: {reason}')
                         except prawcore.exceptions.ServerError as se:
                             handle_exception(se)
         except Exception as e:
             handle_exception(e)
-            time.sleep(60)
+            await asyncio.sleep(60)
 
-def handle_submissions_based_on_user_reports():
-    reddit = initialize_reddit()
+async def handle_submissions_based_on_user_reports():
+    reddit = await initialize_reddit()
     thresholds = {'This is misinformation': 1, 'This is spam': 1}
 
     while True:
         try:
-            for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
-                if isinstance(post, praw.models.Submission) and getattr(post, "user_reports", None):
+            async for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+                if isinstance(post, asyncpraw.models.Submission) and getattr(post, "user_reports", None):
                     reason = post.user_reports[0][0]
                     count = post.user_reports[0][1]
                     if reason in thresholds and count >= thresholds[reason]:
                         try:
-                            post.mod.approve()
+                            await post.mod.approve()
                             print(f'post "{post.title}" approved due to {count} reports for reason: {reason}')
                         except prawcore.exceptions.ServerError as se:
                             handle_exception(se)
         except Exception as e:
             handle_exception(e)
-            time.sleep(60)
+            await asyncio.sleep(60)
 
-def handle_posts_based_on_removal():
-    reddit = initialize_reddit()
+async def handle_posts_based_on_removal():
+    reddit = await initialize_reddit()
     thresholds = {
         'Users Are Responsible for the Content They Post': 2,
         'Discussion-Only for Leaks, Not Distribution': 2,
@@ -202,60 +205,62 @@ def handle_posts_based_on_removal():
 
     while True:
         try:
-            for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
-                if isinstance(post, praw.models.Submission) and getattr(post, "user_reports", None):
+            async for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+                if isinstance(post, asyncpraw.models.Submission) and getattr(post, "user_reports", None):
                     reason = post.user_reports[0][0]
                     count = post.user_reports[0][1]
                     if reason in thresholds and count >= thresholds[reason]:
                         try:
-                            post.mod.remove()
+                            await post.mod.remove()
                             print(f'Submission "{post.title}" removed due to {count} reports for reason: {reason}')
                         except prawcore.exceptions.ServerError as se:
                             handle_exception(se)
         except Exception as e:
             handle_exception(e)
-            time.sleep(60)
+            await asyncio.sleep(60)
 
-def handle_comments_based_on_approval():
-    reddit = initialize_reddit()
+async def handle_comments_based_on_approval():
+    reddit = await initialize_reddit()
     thresholds = {'This is misinformation': 1, 'This is spam': 1}
 
     while True:
         try:
-            for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+            async for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
                 if getattr(comment, "user_reports", None):
                     reason = comment.user_reports[0][0]
                     count = comment.user_reports[0][1]
                     if reason in thresholds and count >= thresholds[reason]:
                         try:
-                            comment.mod.approve()
+                            await comment.mod.approve()
                             print(f'Comment "{comment.body}" approved due to {count} reports for reason: {reason}')
                         except prawcore.exceptions.ServerError as se:
                             handle_exception(se)
         except Exception as e:
             handle_exception(e)
-            time.sleep(60)
+            await asyncio.sleep(60)
             
 # =========================
-# Main: start threads via safe_run
+# Main: start tasks via safe_run
 # =========================
 if __name__ == "__main__":
-    threads = {}
+    async def main():
+        tasks = []
 
-    def add_thread(name, func, *args, **kwargs):
-        t = threading.Thread(target=safe_run, args=(func,)+args, kwargs=kwargs, daemon=True)
-        t.start()
-        threads[name] = t
-        print(f"[STARTED] {name}")
+        def add_task(name, func, *args, **kwargs):
+            task = asyncio.create_task(safe_run(func, *args, **kwargs))
+            tasks.append(task)
+            print(f"[STARTED] {name}")
 
-    add_thread('modqueue_thread', handle_modqueue_items)
-    add_thread('reported_posts_thread', monitor_reported_posts)
-    add_thread('spoiler_status_thread', handle_spoiler_status)
-    add_thread('user_reports_removal_thread', handle_user_reports_and_removal)
-    add_thread('submissions_based_on_user_reports_thread', handle_submissions_based_on_user_reports)
-    add_thread('posts_based_on_removal_thread', handle_posts_based_on_removal)
-    add_thread('comments_based_on_approval_thread', handle_comments_based_on_approval)
+        add_task('modqueue_task', handle_modqueue_items)
+        add_task('reported_posts_task', monitor_reported_posts)
+        add_task('spoiler_status_task', handle_spoiler_status)
+        add_task('user_reports_removal_task', handle_user_reports_and_removal)
+        add_task('submissions_based_on_user_reports_task', handle_submissions_based_on_user_reports)
+        add_task('posts_based_on_removal_task', handle_posts_based_on_removal)
+        add_task('comments_based_on_approval_task', handle_comments_based_on_approval)
 
-    # Keep the main thread alive indefinitely so daemon threads keep running.
-    while True:
-        time.sleep(30)
+        # Keep the main coroutine alive indefinitely so tasks keep running.
+        while True:
+            await asyncio.sleep(30)
+    
+    asyncio.run(main())
