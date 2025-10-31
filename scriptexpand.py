@@ -455,11 +455,11 @@ def run_pokemon_duplicate_bot():
                             # Try to accept invite (will fail if already a mod)
                             subreddit.mod.accept_invite()
                             print(f"\n*** Accepted mod invite for r/{subreddit_name} ***")
-                            setup_subreddit(subreddit_name)
+                            threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
                         except Exception:
                             # Already a moderator, just setup
                             print(f"\n*** Already moderating r/{subreddit_name}, setting up bot ***")
-                            setup_subreddit(subreddit_name)
+                            threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
                 
             except Exception as e:
                 print(f"Error checking for invites: {e}")
