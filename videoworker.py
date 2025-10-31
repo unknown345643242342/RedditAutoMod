@@ -175,8 +175,17 @@ def run_pokemon_duplicate_bot():
                     frame_hash = imagehash.phash(Image.fromarray(gray))
                     hashes.append(frame_hash)
                 
-                # Average hash
-                avg_hash = sum(hashes) / len(hashes)
+                # Convert hashes to binary arrays and average them
+                hash_arrays = [np.array(h.hash).flatten() for h in hashes]
+                avg_hash_array = np.mean(hash_arrays, axis=0)
+                
+                # Convert back to binary (threshold at 0.5)
+                avg_hash_binary = (avg_hash_array > 0.5).astype(bool)
+                
+                # Reshape to 8x8 for phash and create ImageHash object
+                avg_hash_reshaped = avg_hash_binary.reshape((8, 8))
+                avg_hash = imagehash.ImageHash(avg_hash_reshaped)
+                
                 return str(avg_hash)
             except Exception as e:
                 print(f"[r/{subreddit_name}] Video hash error:", e)
