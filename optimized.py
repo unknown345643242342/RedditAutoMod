@@ -55,6 +55,7 @@ def handle_exception(e):
 # =========================
 # Workers
 # =========================
+
 async def monitor_reported_posts():
     reddit = await initialize_reddit()
     subreddit = await reddit.subreddit("PokeLeaks")
@@ -71,11 +72,12 @@ async def monitor_reported_posts():
 
 async def handle_modqueue_items():
     reddit = await initialize_reddit()
+    subreddit = await reddit.subreddit('PokeLeaks')
     timers = {}
 
     while True:
         try:
-            async for item in reddit.subreddit('PokeLeaks').mod.modqueue():
+            async for item in subreddit.mod.modqueue():
                 if getattr(item, "num_reports", 0) == 1 and item.id not in timers:
                     created_time = getattr(item, "created_utc", time.time())
                     timers[item.id] = time.time()
@@ -152,7 +154,7 @@ async def handle_user_reports_and_removal():
 
     while True:
         try:
-            async for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+            async for comment in subreddit.mod.modqueue(limit=100):
                 if isinstance(comment, asyncpraw.models.Comment) and getattr(comment, "user_reports", None):
                     reason = comment.user_reports[0][0]
                     count = comment.user_reports[0][1]
@@ -168,11 +170,12 @@ async def handle_user_reports_and_removal():
 
 async def handle_submissions_based_on_user_reports():
     reddit = await initialize_reddit()
+    subreddit = await reddit.subreddit('PokeLeaks')
     thresholds = {'This is misinformation': 1, 'This is spam': 1}
 
     while True:
         try:
-            async for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+            async for post in subreddit.mod.modqueue(limit=100):
                 if isinstance(post, asyncpraw.models.Submission) and getattr(post, "user_reports", None):
                     reason = post.user_reports[0][0]
                     count = post.user_reports[0][1]
@@ -188,6 +191,7 @@ async def handle_submissions_based_on_user_reports():
 
 async def handle_posts_based_on_removal():
     reddit = await initialize_reddit()
+    subreddit = await reddit.subreddit('PokeLeaks')
     thresholds = {
         'Users Are Responsible for the Content They Post': 2,
         'Discussion-Only for Leaks, Not Distribution': 2,
@@ -205,7 +209,7 @@ async def handle_posts_based_on_removal():
 
     while True:
         try:
-            async for post in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+            async for post in subreddit.mod.modqueue(limit=100):
                 if isinstance(post, asyncpraw.models.Submission) and getattr(post, "user_reports", None):
                     reason = post.user_reports[0][0]
                     count = post.user_reports[0][1]
@@ -221,11 +225,12 @@ async def handle_posts_based_on_removal():
 
 async def handle_comments_based_on_approval():
     reddit = await initialize_reddit()
+    subreddit = await reddit.subreddit('PokeLeaks')
     thresholds = {'This is misinformation': 1, 'This is spam': 1}
 
     while True:
         try:
-            async for comment in reddit.subreddit('PokeLeaks').mod.modqueue(limit=100):
+            async for comment in subreddit.mod.modqueue(limit=100):
                 if getattr(comment, "user_reports", None):
                     reason = comment.user_reports[0][0]
                     count = comment.user_reports[0][1]
