@@ -194,7 +194,7 @@ def run_pokemon_duplicate_bot():
             """Check if submission is a hash-based duplicate"""
             matched_hash = None
             for stored_hash in data['image_hashes'].keys():
-                if hash_value == stored_hash or (imagehash.hex_to_hash(hash_value) - imagehash.hex_to_hash(stored_hash)) <= 3:
+                if hash_value == stored_hash or (imagehash.hex_to_hash(hash_value) - imagehash.hex_to_hash(stored_hash)) <= 4:
                     matched_hash = stored_hash
                     break
             
@@ -417,7 +417,7 @@ def run_pokemon_duplicate_bot():
         # --- Initial scan ---
         print(f"[r/{subreddit_name}] Starting initial scan...")
         try:
-            for submission in subreddit.new(limit=300):
+            for submission in subreddit.new(limit=15):
                 if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                     print(f"[r/{subreddit_name}] Indexing submission (initial scan): ", submission.url)
                     try:
@@ -522,4 +522,24 @@ def run_pokemon_duplicate_bot():
     print("=== Multi-subreddit duplicate bot started ===")
     print("Monitoring for mod invites...")
     while True:
-        time.sleep(3600)  # Keep alive
+        time.sleep(10)  # Keep alive
+        
+# =========================
+# Main: start threads via safe_run
+# =========================
+if __name__ == "__main__":
+    threads = {}
+
+    def add_thread(name, func, *args, **kwargs):
+        t = threading.Thread(target=safe_run, args=(func,)+args, kwargs=kwargs, daemon=True)
+        t.start()
+        threads[name] = t
+        print(f"[STARTED] {name}")
+
+    add_thread('run_pokemon_duplicate_bot_thread', run_pokemon_duplicate_bot)
+
+    # Keep the main thread alive indefinitely so daemon threads keep running.
+    while True:
+        time.sleep(30)
+
+
