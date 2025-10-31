@@ -1,13 +1,13 @@
-import praw
+import asyncpraw
 import prawcore.exceptions
-import requests
+import aiohttp
 import time
 from datetime import datetime
 import numpy as np
 from PIL import Image
 import imagehash
 import cv2
-import threading
+import asyncio
 import traceback
 import openai
 from openai import OpenAI
@@ -20,30 +20,28 @@ import difflib as _difflib
 from datetime import datetime, timezone
 import tempfile
 import os
-import asyncio
-import asyncpraw
 
 # =========================
 # Crash-proof runner
 # =========================
-def safe_run(target, *args, **kwargs):
+async def safe_run_async(target, *args, **kwargs):
     """
-    Keeps a target function running forever.
+    Keeps a target async function running forever.
     If the function raises, log the error, sleep briefly, and run it again.
     """
     while True:
         try:
-            target(*args, **kwargs)
+            await target(*args, **kwargs)
         except Exception as e:
             print(f"[FATAL] {target.__name__} crashed: {e}")
             traceback.print_exc()
-            time.sleep(10)  # brief cooldown before retrying
+            await asyncio.sleep(10)  # brief cooldown before retrying
 
 # =========================
 # Reddit init + error handler
 # =========================
-def initialize_reddit():
-    return praw.Reddit(
+async def initialize_reddit():
+    return asyncpraw.Reddit(
         client_id='EdRh_0BZNsX0PwqXYrNbGA',
         client_secret='zTNGq-dGk5HLf2oKxvT_iXIlzBX7kg',
         username='DupliGuard',
@@ -59,17 +57,17 @@ def handle_exception(e):
 # Workers
 # =========================
 
-def run_pokemon_duplicate_bot():
-    reddit = initialize_reddit()
+async def run_pokemon_duplicate_bot():
+    reddit = await initialize_reddit()
     
     # Global dictionary to store per-subreddit data
     subreddit_data = {}
     
-    def setup_subreddit(subreddit_name):
+    async def setup_subreddit(subreddit_name):
         """Initialize data structures and monitoring for a specific subreddit"""
         print(f"\n=== Setting up bot for r/{subreddit_name} ===")
         
-        subreddit = reddit.subreddit(subreddit_name)
+        subreddit = await reddit.subreddit(subreddit_name)
         
         # Create dedicated dictionaries for this subreddit
         data = {
@@ -162,7 +160,7 @@ def run_pokemon_duplicate_bot():
             else:
                 return f"{seconds} second{'s' if seconds != 1 else ''} ago"
 
-        def post_comment(submission, original_post_author, original_post_title, original_post_date, original_post_utc, original_status, original_post_permalink, matched_hash):
+        async def post_comment(submission, original_post_author, original_post_title, original_post_date, original_post_utc, original_status, original_post_permalink, matched_hash):
             max_retries = 3
             retries = 0
             age_text = format_age(original_post_utc)
@@ -192,15 +190,15 @@ def run_pokemon_duplicate_bot():
                         f"| {original_post_author} | [{original_post_title}]({original_post_permalink}) | {original_post_date} | {age_text} | {original_status} |"
                         f"{repost_section}"
                     )
-                    comment = submission.reply(comment_text)
-                    comment.mod.distinguish(sticky=True)
-                    comment.mod.lock()
+                    comment = await submission.reply(comment_text)
+                    await comment.mod.distinguish(sticky=True)
+                    await comment.mod.lock()
                     print(f"[r/{subreddit_name}] Duplicate removed and comment posted (locked): ", submission.url)
                     return True
                 except Exception as e:
                     handle_exception(e)
                     retries += 1
-                    time.sleep(1)
+                    await asyncio.sleep(1)
             return False
 
         def add_to_repost_history(matched_hash, submission):
@@ -218,9 +216,12 @@ def run_pokemon_duplicate_bot():
             )
             data['repost_history'][matched_hash].append(repost_data)
 
-        def load_and_process_image(url):
+        async def load_and_process_image(url):
             """Load image from URL and compute hash, descriptors, AI features"""
-            image_data = requests.get(url, timeout=10).content
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    image_data = await response.read()
+            
             img = np.asarray(bytearray(image_data), dtype=np.uint8)
             img = cv2.imdecode(img, cv2.IMREAD_COLOR)
             
@@ -233,13 +234,15 @@ def run_pokemon_duplicate_bot():
                 
             return img, hash_value, descriptors, features
 
-        def get_cached_ai_features(submission_id):
+        async def get_cached_ai_features(submission_id):
             """Get AI features from cache or compute them"""
             if submission_id in data['ai_features']:
                 return data['ai_features'][submission_id]
             
-            old_submission = reddit.submission(id=submission_id)
-            old_image_data = requests.get(old_submission.url, timeout=10).content
+            old_submission = await reddit.submission(id=submission_id)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(old_submission.url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    old_image_data = await response.read()
             old_img = cv2.imdecode(np.asarray(bytearray(old_image_data), dtype=np.uint8), cv2.IMREAD_COLOR)
             old_features = get_ai_features(old_img)
             data['ai_features'][submission_id] = old_features
@@ -251,7 +254,7 @@ def run_pokemon_duplicate_bot():
                 return (features1 @ features2.T).item()
             return 0
 
-        def check_hash_duplicate(submission, hash_value, new_features):
+        async def check_hash_duplicate(submission, hash_value, new_features):
             """Check if submission is a hash-based duplicate"""
             matched_hash = None
             for stored_hash in data['image_hashes'].keys():
@@ -267,8 +270,8 @@ def run_pokemon_duplicate_bot():
             if submission.id == original_id or submission.created_utc <= original_time:
                 return False, None, None, None, None, None, None, None
             
-            original_submission = reddit.submission(id=original_id)
-            original_features = get_cached_ai_features(original_submission.id)
+            original_submission = await reddit.submission(id=original_id)
+            original_features = await get_cached_ai_features(original_submission.id)
             
             ai_score = calculate_ai_similarity(new_features, original_features)
             
@@ -281,20 +284,20 @@ def run_pokemon_duplicate_bot():
             
             return False, None, None, None, None, None, None, None
 
-        def check_orb_duplicate(submission, descriptors, new_features):
+        async def check_orb_duplicate(submission, descriptors, new_features):
             """Check if submission is an ORB-based duplicate"""
             for old_id, old_desc in data['orb_descriptors'].items():
                 sim = orb_similarity(descriptors, old_desc)
                 
                 if sim > 0.50:
-                    old_features = get_cached_ai_features(old_id)
+                    old_features = await get_cached_ai_features(old_id)
                     
                     ai_score = calculate_ai_similarity(new_features, old_features)
                     
                     if ai_score > 0.75:
                         print(f"[r/{subreddit_name}] ORB duplicate found! AI similarity: {ai_score:.2f}")
                         
-                        original_submission = reddit.submission(id=old_id)
+                        original_submission = await reddit.submission(id=old_id)
                         original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
                         old_hash = next((h for h, v in data['image_hashes'].items() if v[0] == old_id), None)
                         original_status = "Removed by Moderator" if old_hash and old_hash in data['moderator_removed_hashes'] else "Active"
@@ -303,23 +306,23 @@ def run_pokemon_duplicate_bot():
             
             return False, None, None, None, None, None, None, None
 
-        def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink, matched_hash):
+        async def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink, matched_hash):
             """Remove duplicate and post comment if not approved"""
             if not submission.approved:
                 # Post comment first (before adding to history so current post isn't included)
-                post_comment(submission, author, title, date, utc, status, permalink, matched_hash)
+                await post_comment(submission, author, title, date, utc, status, permalink, matched_hash)
                 # Then add to history for future reposts
                 add_to_repost_history(matched_hash, submission)
-                submission.mod.remove()
+                await submission.mod.remove()
                 print(f"[r/{subreddit_name}] Duplicate removed by {detection_method}: {submission.url}")
             return True
 
-        def handle_moderator_removed_repost(submission, hash_value):
+        async def handle_moderator_removed_repost(submission, hash_value):
             """Handle reposts of moderator-removed images"""
             if hash_value in data['moderator_removed_hashes'] and not submission.approved:
-                original_submission = reddit.submission(id=data['image_hashes'][hash_value][0])
+                original_submission = await reddit.submission(id=data['image_hashes'][hash_value][0])
                 # Post comment first (before adding to history)
-                post_comment(
+                await post_comment(
                     submission,
                     original_submission.author.name,
                     original_submission.title,
@@ -331,31 +334,31 @@ def run_pokemon_duplicate_bot():
                 )
                 # Then add to history
                 add_to_repost_history(hash_value, submission)
-                submission.mod.remove()
+                await submission.mod.remove()
                 print(f"[r/{subreddit_name}] Repost of a moderator-removed image removed: ", submission.url)
                 return True
             return False
 
-        def process_submission_for_duplicates(submission, context="stream"):
+        async def process_submission_for_duplicates(submission, context="stream"):
             """Main duplicate detection logic - works for both mod queue and stream"""
             try:
-                img, hash_value, descriptors, new_features = load_and_process_image(submission.url)
+                img, hash_value, descriptors, new_features = await load_and_process_image(submission.url)
                 data['ai_features'][submission.id] = new_features
                 
-                if handle_moderator_removed_repost(submission, hash_value):
+                if await handle_moderator_removed_repost(submission, hash_value):
                     return True
                 
-                is_duplicate, author, title, date, utc, status, permalink, matched_hash = check_hash_duplicate(
+                is_duplicate, author, title, date, utc, status, permalink, matched_hash = await check_hash_duplicate(
                     submission, hash_value, new_features
                 )
                 if is_duplicate:
-                    return handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink, matched_hash)
+                    return await handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink, matched_hash)
                 
-                is_duplicate, author, title, date, utc, status, permalink, matched_hash = check_orb_duplicate(
+                is_duplicate, author, title, date, utc, status, permalink, matched_hash = await check_orb_duplicate(
                     submission, descriptors, new_features
                 )
                 if is_duplicate:
-                    return handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink, matched_hash)
+                    return await handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink, matched_hash)
                 
                 if hash_value not in data['image_hashes']:
                     data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
@@ -364,7 +367,7 @@ def run_pokemon_duplicate_bot():
                     print(f"[r/{subreddit_name}] Stored new original: {submission.url}")
                 
                 if context == "modqueue" and not submission.approved:
-                    submission.mod.approve()
+                    await submission.mod.approve()
                     print(f"[r/{subreddit_name}] Original submission approved: ", submission.url)
                 
                 return False
@@ -381,7 +384,7 @@ def run_pokemon_duplicate_bot():
             async def monitor_mod_log():
                 while True:
                     try:
-                        for log_entry in subreddit.mod.stream.log(action='removelink', skip_existing=True):
+                        async for log_entry in subreddit.mod.stream.log(action='removelink', skip_existing=True):
                             if log_entry.id in processed_log_items:
                                 continue
                             
@@ -441,7 +444,7 @@ def run_pokemon_duplicate_bot():
                     
                     for hash_value, submission_id in all_to_check:
                         try:
-                            original_submission = reddit.submission(id=submission_id)
+                            original_submission = await reddit.submission(id=submission_id)
                             original_author = original_submission.author
                             
                             if original_author is None:
@@ -477,11 +480,11 @@ def run_pokemon_duplicate_bot():
         # --- Initial scan ---
         print(f"[r/{subreddit_name}] Starting initial scan...")
         try:
-            for submission in subreddit.new(limit=15):
-                if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+            async for submission in subreddit.new(limit=15):
+                if isinstance(submission, asyncpraw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                     print(f"[r/{subreddit_name}] Indexing submission (initial scan): ", submission.url)
                     try:
-                        img, hash_value, descriptors, features = load_and_process_image(submission.url)
+                        img, hash_value, descriptors, features = await load_and_process_image(submission.url)
                         if hash_value not in data['image_hashes']:
                             data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
                             data['orb_descriptors'][submission.id] = descriptors
@@ -497,10 +500,13 @@ def run_pokemon_duplicate_bot():
         async def modqueue_worker():
             while True:
                 try:
-                    modqueue_submissions = subreddit.mod.modqueue(only='submission', limit=None)
+                    modqueue_submissions = []
+                    async for submission in subreddit.mod.modqueue(only='submission', limit=None):
+                        modqueue_submissions.append(submission)
+                    
                     modqueue_submissions = sorted(modqueue_submissions, key=lambda x: x.created_utc)
                     for submission in modqueue_submissions:
-                        if not isinstance(submission, praw.models.Submission):
+                        if not isinstance(submission, asyncpraw.models.Submission):
                             continue
                         
                         print(f"[r/{subreddit_name}] Scanning Mod Queue: ", submission.url)
@@ -513,7 +519,7 @@ def run_pokemon_duplicate_bot():
                             continue
                         
                         if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                            is_duplicate = process_submission_for_duplicates(submission, context="modqueue")
+                            is_duplicate = await process_submission_for_duplicates(submission, context="modqueue")
                             data['processed_modqueue_submissions'].add(submission.id)
 
                 except Exception as e:
@@ -524,15 +530,15 @@ def run_pokemon_duplicate_bot():
         async def stream_worker():
             while True:
                 try:
-                    for submission in subreddit.stream.submissions(skip_existing=True):
-                        if submission.created_utc > data['current_time'] and isinstance(submission, praw.models.Submission):
+                    async for submission in subreddit.stream.submissions(skip_existing=True):
+                        if submission.created_utc > data['current_time'] and isinstance(submission, asyncpraw.models.Submission):
                             if submission.id in data['processed_modqueue_submissions']:
                                 continue
 
                             print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
                             
                             if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                                process_submission_for_duplicates(submission, context="stream")
+                                await process_submission_for_duplicates(submission, context="stream")
 
                     data['current_time'] = int(time.time())
                 except Exception as e:
@@ -540,74 +546,67 @@ def run_pokemon_duplicate_bot():
                 await asyncio.sleep(20)
         
         # Start async workers
-        def run_async_workers():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(asyncio.gather(
-                check_removed_original_posts(),
-                modqueue_worker(),
-                stream_worker()
-            ))
-        
-        threading.Thread(target=run_async_workers, daemon=True).start()
+        asyncio.create_task(check_removed_original_posts())
+        asyncio.create_task(modqueue_worker())
+        asyncio.create_task(stream_worker())
         
         print(f"[r/{subreddit_name}] Bot fully operational!\n")
 
     # --- Accept invites and setup subreddits ---
-    def check_for_invites():
+    async def check_for_invites():
         """Check for moderator invites and automatically accept them"""
         while True:
             try:
                 # Check unread messages for mod invites
-                for message in reddit.inbox.unread(limit=None):
+                async for message in reddit.inbox.unread(limit=None):
                     if "invitation to moderate" in message.subject.lower():
                         subreddit_name = message.subreddit.display_name
                         print(f"\n*** Found mod invite for r/{subreddit_name} ***")
                         try:
-                            message.subreddit.mod.accept_invite()
+                            await message.subreddit.mod.accept_invite()
                             print(f"✅ Accepted mod invite for r/{subreddit_name}")
-                            threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
+                            asyncio.create_task(setup_subreddit(subreddit_name))
                         except Exception as e:
                             print(f"Error accepting invite for r/{subreddit_name}: {e}")
-                        message.mark_read()
+                        await message.mark_read()
             
                 # Also check for already accepted subreddits
-                for subreddit in reddit.user.moderator_subreddits(limit=None):
+                async for subreddit in reddit.user.moderator_subreddits(limit=None):
                     subreddit_name = subreddit.display_name
                     if subreddit_name not in subreddit_data:
                         print(f"\n*** Already moderating r/{subreddit_name}, setting up bot ***")
-                        threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
+                        asyncio.create_task(setup_subreddit(subreddit_name))
             
             except Exception as e:
                 print(f"Error checking for invites: {e}")
         
-            time.sleep(60)
+            await asyncio.sleep(60)
     
     # Start the invite checker
-    threading.Thread(target=check_for_invites, daemon=True).start()
+    asyncio.create_task(check_for_invites())
     
     # Keep main thread alive
     print("=== Multi-subreddit duplicate bot started ===")
     print("Monitoring for mod invites...")
     while True:
-        time.sleep(10)  # Keep alive
+        await asyncio.sleep(10)  # Keep alive
         
 # =========================
-# Main: start threads via safe_run
+# Main: start async bot via safe_run
 # =========================
 if __name__ == "__main__":
-    threads = {}
-
-    def add_thread(name, func, *args, **kwargs):
-        t = threading.Thread(target=safe_run, args=(func,)+args, kwargs=kwargs, daemon=True)
-        t.start()
-        threads[name] = t
-        print(f"[STARTED] {name}")
-
-    add_thread('run_pokemon_duplicate_bot_thread', run_pokemon_duplicate_bot)
-
-    # Keep the main thread alive indefinitely so daemon threads keep running.
-    while True:
-        time.sleep(30)
-
-
+    async def main():
+        tasks = []
+        
+        async def add_task(name, func, *args, **kwargs):
+            task = asyncio.create_task(safe_run_async(func, *args, **kwargs))
+            tasks.append(task)
+            print(f"[STARTED] {name}")
+        
+        await add_task('run_pokemon_duplicate_bot_task', run_pokemon_duplicate_bot)
+        
+        # Keep the main coroutine alive indefinitely
+        while True:
+            await asyncio.sleep(30)
+    
+    asyncio.run(main())
