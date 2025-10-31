@@ -106,17 +106,21 @@ def run_pokemon_duplicate_bot():
             retries = 0
             age_text = format_age(original_post_utc)
             
-            # Build repost history section
+            # Build repost history section (excluding current submission)
             repost_section = ""
             if matched_hash in data['repost_history'] and len(data['repost_history'][matched_hash]) > 0:
-                repost_section = "\n\n---\n\n**Previous repost attempts:**\n\n"
-                repost_section += "| Author | Title | Date | Age |\n"
-                repost_section += "|:------:|:-----:|:----:|:---:|\n"
+                # Filter out current submission from history
+                previous_reposts = [r for r in data['repost_history'][matched_hash] if r[4] != submission.permalink]
                 
-                for repost in data['repost_history'][matched_hash]:
-                    repost_author, repost_title, repost_date, repost_utc, repost_permalink = repost
-                    repost_age = format_age(repost_utc)
-                    repost_section += f"| {repost_author} | [{repost_title}]({repost_permalink}) | {repost_date} | {repost_age} |\n"
+                if len(previous_reposts) > 0:
+                    repost_section = "\n\n---\n\n**Previous repost attempts:**\n\n"
+                    repost_section += "| Author | Title | Date | Age | Status |\n"
+                    repost_section += "|:------:|:-----:|:----:|:---:|:------:|\n"
+                    
+                    for repost in previous_reposts:
+                        repost_author, repost_title, repost_date, repost_utc, repost_permalink, repost_status = repost
+                        repost_age = format_age(repost_utc)
+                        repost_section += f"| {repost_author} | [{repost_title}]({repost_permalink}) | {repost_date} | {repost_age} | {repost_status} |\n"
             
             while retries < max_retries:
                 try:
@@ -148,7 +152,8 @@ def run_pokemon_duplicate_bot():
                 submission.title,
                 datetime.utcfromtimestamp(submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
                 submission.created_utc,
-                submission.permalink
+                submission.permalink,
+                "Removed (Repost)"  # Status for reposts
             )
             data['repost_history'][matched_hash].append(repost_data)
 
@@ -240,18 +245,19 @@ def run_pokemon_duplicate_bot():
         def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink, matched_hash):
             """Remove duplicate and post comment if not approved"""
             if not submission.approved:
+                # Post comment first (before adding to history so current post isn't included)
+                post_comment(submission, author, title, date, utc, status, permalink, matched_hash)
+                # Then add to history for future reposts
                 add_to_repost_history(matched_hash, submission)
                 submission.mod.remove()
-                post_comment(submission, author, title, date, utc, status, permalink, matched_hash)
                 print(f"[r/{subreddit_name}] Duplicate removed by {detection_method}: {submission.url}")
             return True
 
         def handle_moderator_removed_repost(submission, hash_value):
             """Handle reposts of moderator-removed images"""
             if hash_value in data['moderator_removed_hashes'] and not submission.approved:
-                add_to_repost_history(hash_value, submission)
-                submission.mod.remove()
                 original_submission = reddit.submission(id=data['image_hashes'][hash_value][0])
+                # Post comment first (before adding to history)
                 post_comment(
                     submission,
                     original_submission.author.name,
@@ -262,6 +268,9 @@ def run_pokemon_duplicate_bot():
                     original_submission.permalink,
                     hash_value
                 )
+                # Then add to history
+                add_to_repost_history(hash_value, submission)
+                submission.mod.remove()
                 print(f"[r/{subreddit_name}] Repost of a moderator-removed image removed: ", submission.url)
                 return True
             return False
