@@ -118,6 +118,10 @@ def run_pokemon_duplicate_bot():
         def download_video(url, submission=None):
             """Download video to temporary file"""
             try:
+                # Handle YouTube videos specially
+                if is_youtube_url(url):
+                    return download_youtube_video(url)
+                
                 # If submission provided and it's a v.redd.it link, get proper URL
                 if submission and 'v.redd.it' in url:
                     url = get_reddit_video_url(submission)
@@ -216,7 +220,8 @@ def run_pokemon_duplicate_bot():
         def is_video_url(url):
             """Check if URL is a video"""
             video_extensions = ('.mp4', '.webm', '.mov', '.avi', '.gifv')
-            video_domains = ('v.redd.it', 'i.imgur.com/.*\.gifv', 'gfycat.com', 'redgifs.com')
+            video_domains = ('v.redd.it', 'i.imgur.com/.*\.gifv', 'gfycat.com', 'redgifs.com', 
+                           'youtube.com', 'youtu.be', 'vimeo.com', 'streamable.com')
             
             if url.endswith(video_extensions):
                 return True
@@ -226,6 +231,38 @@ def run_pokemon_duplicate_bot():
                     return True
             
             return False
+
+        def is_youtube_url(url):
+            """Check if URL is a YouTube link"""
+            return 'youtube.com' in url or 'youtu.be' in url
+
+        def download_youtube_video(url):
+            """Download YouTube video using yt-dlp"""
+            try:
+                import yt_dlp
+                
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                temp_file.close()
+                
+                ydl_opts = {
+                    'format': 'worst[ext=mp4]/worst',  # Get lowest quality for speed
+                    'outtmpl': temp_file.name,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'extract_flat': False,
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                
+                return temp_file.name
+            except ImportError:
+                print(f"[r/{subreddit_name}] yt-dlp not installed. Cannot process YouTube videos.")
+                print("Install with: pip install yt-dlp")
+                return None
+            except Exception as e:
+                print(f"[r/{subreddit_name}] YouTube download error: {e}")
+                return None
 
         def load_and_process_video(url, submission=None):
             """Download video, extract frames, compute hash and features"""
