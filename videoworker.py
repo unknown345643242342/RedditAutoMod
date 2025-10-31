@@ -312,12 +312,12 @@ def run_pokemon_duplicate_bot():
                 handle_exception(e)
                 return False
 
-        def check_removed_original_posts():
+        async def check_removed_original_posts():
             """Monitor for immediate removal detection using dual approach"""
             processed_log_items = set()
             last_checked = {}
             
-            def monitor_mod_log():
+            async def monitor_mod_log():
                 while True:
                     try:
                         for log_entry in subreddit.mod.stream.log(action='removelink', skip_existing=True):
@@ -342,9 +342,10 @@ def run_pokemon_duplicate_bot():
                         
                     except Exception as e:
                         print(f"[r/{subreddit_name}] Error in mod log monitor: {e}")
-                        time.sleep(5)
+                        await asyncio.sleep(5)
             
-            threading.Thread(target=monitor_mod_log, daemon=True).start()
+            # Start monitor_mod_log as a task
+            asyncio.create_task(monitor_mod_log())
             
             while True:
                 try:
@@ -400,7 +401,7 @@ def run_pokemon_duplicate_bot():
                             checked_this_cycle += 1
                             
                             if checked_this_cycle >= 10:
-                                time.sleep(60)
+                                await asyncio.sleep(60)
                                 checked_this_cycle = 0
                             
                         except Exception as e:
@@ -410,9 +411,7 @@ def run_pokemon_duplicate_bot():
                 except Exception as e:
                     handle_exception(e)
                 
-                time.sleep(60)
-        
-        threading.Thread(target=check_removed_original_posts, daemon=True).start()
+                await asyncio.sleep(60)
 
         # --- Initial scan ---
         print(f"[r/{subreddit_name}] Starting initial scan...")
@@ -434,7 +433,7 @@ def run_pokemon_duplicate_bot():
         print(f"[r/{subreddit_name}] Initial scan complete. Indexed {len(data['image_hashes'])} images.")
 
         # --- Mod Queue worker ---
-        def modqueue_worker():
+        async def modqueue_worker():
             while True:
                 try:
                     modqueue_submissions = subreddit.mod.modqueue(only='submission', limit=None)
@@ -458,12 +457,10 @@ def run_pokemon_duplicate_bot():
 
                 except Exception as e:
                     handle_exception(e)
-                time.sleep(15)
-
-        threading.Thread(target=modqueue_worker, daemon=True).start()
+                await asyncio.sleep(15)
 
         # --- Stream new submissions ---
-        def stream_worker():
+        async def stream_worker():
             while True:
                 try:
                     for submission in subreddit.stream.submissions(skip_existing=True):
@@ -479,9 +476,19 @@ def run_pokemon_duplicate_bot():
                     data['current_time'] = int(time.time())
                 except Exception as e:
                     handle_exception(e)
-                time.sleep(20)
+                await asyncio.sleep(20)
         
-        threading.Thread(target=stream_worker, daemon=True).start()
+        # Start async workers
+        def run_async_workers():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(asyncio.gather(
+                check_removed_original_posts(),
+                modqueue_worker(),
+                stream_worker()
+            ))
+        
+        threading.Thread(target=run_async_workers, daemon=True).start()
         
         print(f"[r/{subreddit_name}] Bot fully operational!\n")
 
