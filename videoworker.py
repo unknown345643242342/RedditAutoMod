@@ -5,6 +5,14 @@ def run_pokemon_duplicate_bot():
     subreddit_data = {}
     subreddit_data_lock = threading.Lock()
     
+    # Default thresholds
+    DEFAULT_THRESHOLDS = {
+        'hash_distance': 3,
+        'hash_ai_similarity': 0.50,
+        'orb_similarity': 0.50,
+        'orb_ai_similarity': 0.75
+    }
+    
     # Shared AI models (initialized once)
     device = "cpu"
     efficientnet_model = models.efficientnet_b0(pretrained=True)
@@ -27,6 +35,7 @@ def run_pokemon_duplicate_bot():
         # Create dedicated dictionaries for this subreddit
         data = {
             'subreddit': subreddit,
+            'thresholds': DEFAULT_THRESHOLDS.copy(),
             'image_hashes': {},
             'orb_descriptors': {},
             'moderator_removed_hashes': set(),
@@ -40,6 +49,8 @@ def run_pokemon_duplicate_bot():
         
         with subreddit_data_lock:
             subreddit_data[subreddit_name] = data
+        
+        print(f"[r/{subreddit_name}] Loaded thresholds: {data['thresholds']}")
         
         # --- Helper functions for this subreddit ---
         def get_ai_features(img):
@@ -160,8 +171,10 @@ def run_pokemon_duplicate_bot():
         def check_hash_duplicate(submission, hash_value, new_features):
             """Check if submission is a hash-based duplicate"""
             matched_hash = None
+            hash_dist_threshold = int(data['thresholds']['hash_distance'])
+            
             for stored_hash in data['image_hashes'].keys():
-                if hash_value == stored_hash or (imagehash.hex_to_hash(hash_value) - imagehash.hex_to_hash(stored_hash)) <= 3:
+                if hash_value == stored_hash or (imagehash.hex_to_hash(hash_value) - imagehash.hex_to_hash(stored_hash)) <= hash_dist_threshold:
                     matched_hash = stored_hash
                     break
             
@@ -180,7 +193,7 @@ def run_pokemon_duplicate_bot():
             
             print(f"[r/{subreddit_name}] Hash match detected. AI similarity: {ai_score:.2f}")
             
-            if ai_score > 0.50:
+            if ai_score > data['thresholds']['hash_ai_similarity']:
                 original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
                 original_status = "Removed by Moderator" if matched_hash in data['moderator_removed_hashes'] else "Active"
                 return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
@@ -192,12 +205,12 @@ def run_pokemon_duplicate_bot():
             for old_id, old_desc in data['orb_descriptors'].items():
                 sim = orb_similarity(descriptors, old_desc)
                 
-                if sim > 0.50:
+                if sim > data['thresholds']['orb_similarity']:
                     old_features = get_cached_ai_features(old_id)
                     
                     ai_score = calculate_ai_similarity(new_features, old_features)
                     
-                    if ai_score > 0.75:
+                    if ai_score > data['thresholds']['orb_ai_similarity']:
                         print(f"[r/{subreddit_name}] ORB duplicate found! AI similarity: {ai_score:.2f}")
                         
                         original_submission = reddit.submission(id=old_id)
@@ -484,13 +497,14 @@ def run_pokemon_duplicate_bot():
             
             time.sleep(20)
     
-    # --- Accept invites and setup subreddits ---
-    def check_for_invites():
-        """Check for moderator invites and automatically accept them"""
+    # --- Accept invites and check for threshold adjustment messages ---
+    def check_for_invites_and_messages():
+        """Check for moderator invites and threshold adjustment messages"""
         while True:
             try:
-                # Check unread messages for mod invites
+                # Check unread messages for mod invites AND threshold commands
                 for message in reddit.inbox.unread(limit=None):
+                    # Handle mod invites
                     if "invitation to moderate" in message.subject.lower():
                         subreddit_name = message.subreddit.display_name
                         print(f"\n*** Found mod invite for r/{subreddit_name} ***")
@@ -501,6 +515,73 @@ def run_pokemon_duplicate_bot():
                         except Exception as e:
                             print(f"Error accepting invite for r/{subreddit_name}: {e}")
                         message.mark_read()
+                    
+                    # Handle threshold adjustment messages
+                    else:
+                        try:
+                            body = message.body.strip().lower()
+                            author = message.author.name
+                            
+                            # Find which subreddit this message is about
+                            target_subreddit = None
+                            for sub_name, sub_data in subreddit_data.items():
+                                try:
+                                    # Check if message author is a moderator of this subreddit
+                                    if sub_data['subreddit'].moderator(author):
+                                        target_subreddit = sub_name
+                                        target_data = sub_data
+                                        break
+                                except:
+                                    continue
+                            
+                            if target_subreddit:
+                                # Show current thresholds
+                                if '!showthresholds' in body:
+                                    response = f"""**Current Threshold Settings for r/{target_subreddit}:**
+
+- hash_distance: {target_data['thresholds']['hash_distance']}
+- hash_ai_similarity: {target_data['thresholds']['hash_ai_similarity']}
+- orb_similarity: {target_data['thresholds']['orb_similarity']}
+- orb_ai_similarity: {target_data['thresholds']['orb_ai_similarity']}
+
+To adjust: `!setthreshold <parameter> <value>`
+To reset: `!resetthresholds`"""
+                                    message.reply(response)
+                                    print(f"[r/{target_subreddit}] Showed thresholds to {author}")
+                                    message.mark_read()
+                                
+                                # Reset thresholds
+                                elif '!resetthresholds' in body:
+                                    target_data['thresholds'] = DEFAULT_THRESHOLDS.copy()
+                                    message.reply(f"✅ Thresholds reset to defaults for r/{target_subreddit}")
+                                    print(f"[r/{target_subreddit}] Thresholds reset to defaults by {author}")
+                                    print(f"[r/{target_subreddit}] Current thresholds: {target_data['thresholds']}")
+                                    message.mark_read()
+                                
+                                # Set threshold
+                                elif '!setthreshold' in body:
+                                    parts = body.split()
+                                    if len(parts) >= 3:
+                                        param = parts[1].lower()
+                                        try:
+                                            value = float(parts[2])
+                                            
+                                            if param in target_data['thresholds']:
+                                                old_value = target_data['thresholds'][param]
+                                                target_data['thresholds'][param] = value
+                                                message.reply(f"✅ Updated `{param}` from `{old_value}` to `{value}` for r/{target_subreddit}")
+                                                print(f"[r/{target_subreddit}] Threshold {param} updated: {old_value} → {value} by {author}")
+                                                print(f"[r/{target_subreddit}] Current thresholds: {target_data['thresholds']}")
+                                            else:
+                                                message.reply(f"❌ Unknown parameter: `{param}`\n\nValid parameters: hash_distance, hash_ai_similarity, orb_similarity, orb_ai_similarity")
+                                        except ValueError:
+                                            message.reply(f"❌ Invalid value. Please provide a number.")
+                                    else:
+                                        message.reply(f"❌ Usage: `!setthreshold <parameter> <value>`")
+                                    message.mark_read()
+                        
+                        except Exception as e:
+                            print(f"Error processing message: {e}")
             
                 # Also check for already accepted subreddits
                 for subreddit in reddit.user.moderator_subreddits(limit=None):
@@ -510,12 +591,12 @@ def run_pokemon_duplicate_bot():
                         setup_subreddit(subreddit_name)
             
             except Exception as e:
-                print(f"Error checking for invites: {e}")
+                print(f"Error checking for invites and messages: {e}")
         
             time.sleep(60)
     
     # Start ONLY 5 shared worker threads (total, regardless of number of subreddits)
-    threading.Thread(target=check_for_invites, daemon=True).start()
+    threading.Thread(target=check_for_invites_and_messages, daemon=True).start()
     threading.Thread(target=shared_mod_log_monitor, daemon=True).start()
     threading.Thread(target=shared_removal_checker, daemon=True).start()
     threading.Thread(target=shared_modqueue_worker, daemon=True).start()
@@ -524,6 +605,6 @@ def run_pokemon_duplicate_bot():
     # Keep main thread alive
     print("=== Multi-subreddit duplicate bot started ===")
     print("Running with 5 shared worker threads for all subreddits")
-    print("Monitoring for mod invites...")
+    print("Monitoring for mod invites and threshold adjustment messages...")
     while True:
         time.sleep(3600)  # Keep alive
