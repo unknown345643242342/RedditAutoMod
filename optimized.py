@@ -26,95 +26,16 @@ def run_pokemon_duplicate_bot():
     orb_detector = cv2.ORB_create()
     bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     
-    def load_thresholds_from_wiki(subreddit):
-        """Load thresholds from subreddit wiki page"""
-        try:
-            wiki_page = subreddit.wiki['duplicatebot_config']
-            config_text = wiki_page.content_md
-            
-            thresholds = DEFAULT_THRESHOLDS.copy()
-            
-            for line in config_text.split('\n'):
-                line = line.strip()
-                if ':' in line and not line.startswith('#'):
-                    key, value = line.split(':', 1)
-                    key = key.strip().lower()
-                    value = value.strip()
-                    
-                    if key in thresholds:
-                        try:
-                            thresholds[key] = float(value)
-                        except ValueError:
-                            print(f"Invalid value for {key}: {value}")
-            
-            return thresholds
-        except Exception as e:
-            print(f"Could not load config from wiki, using defaults: {e}")
-            return DEFAULT_THRESHOLDS.copy()
-    
-    def save_thresholds_to_wiki(subreddit, thresholds):
-        """Save thresholds to subreddit wiki page"""
-        try:
-            config_text = f"""# Duplicate Detection Bot Configuration
-
-## Threshold Settings
-
-hash_distance: {thresholds['hash_distance']}
-hash_ai_similarity: {thresholds['hash_ai_similarity']}
-orb_similarity: {thresholds['orb_similarity']}
-orb_ai_similarity: {thresholds['orb_ai_similarity']}
-
-## Threshold Descriptions
-
-- **hash_distance** (0-64): Maximum difference between perceptual hashes to consider images similar. Lower = stricter. Default: 3
-- **hash_ai_similarity** (0.0-1.0): Minimum AI similarity score for hash matches. Higher = stricter. Default: 0.50
-- **orb_similarity** (0.0-1.0): Minimum ORB feature matching score. Higher = stricter. Default: 0.50
-- **orb_ai_similarity** (0.0-1.0): Minimum AI similarity score for ORB matches. Higher = stricter. Default: 0.75
-
-## How to Adjust Thresholds
-
-Moderators can adjust these values by:
-1. Editing this wiki page directly
-2. Sending a modmail with: `!setthreshold <parameter> <value>`
-3. Replying to any bot comment with: `!setthreshold <parameter> <value>`
-
-Examples:
-- `!setthreshold hash_ai_similarity 0.60` - Require 60% AI similarity for hash matches
-- `!setthreshold orb_similarity 0.65` - Require 65% ORB feature matching
-- `!showthresholds` - Display current threshold values
-- `!resetthresholds` - Reset all thresholds to defaults
-
-Changes take effect immediately.
-"""
-            
-            subreddit.wiki.create('duplicatebot_config', config_text, reason='Bot configuration update')
-            return True
-        except Exception as e:
-            # Try to edit if page already exists
-            try:
-                wiki_page = subreddit.wiki['duplicatebot_config']
-                wiki_page.edit(config_text, reason='Bot configuration update')
-                return True
-            except Exception as e2:
-                print(f"Could not save config to wiki: {e2}")
-                return False
-    
     def setup_subreddit(subreddit_name):
         """Initialize data structures for a specific subreddit (no new threads)"""
         print(f"\n=== Setting up bot for r/{subreddit_name} ===")
         
         subreddit = reddit.subreddit(subreddit_name)
         
-        # Load thresholds from wiki or use defaults
-        thresholds = load_thresholds_from_wiki(subreddit)
-        
-        # Initialize wiki page if it doesn't exist
-        save_thresholds_to_wiki(subreddit, thresholds)
-        
         # Create dedicated dictionaries for this subreddit
         data = {
             'subreddit': subreddit,
-            'thresholds': thresholds,
+            'thresholds': DEFAULT_THRESHOLDS.copy(),
             'image_hashes': {},
             'orb_descriptors': {},
             'moderator_removed_hashes': set(),
@@ -123,14 +44,13 @@ Changes take effect immediately.
             'ai_features': {},
             'current_time': int(time.time()),
             'processed_log_items': set(),
-            'last_checked': {},
-            'last_threshold_reload': time.time()
+            'last_checked': {}
         }
         
         with subreddit_data_lock:
             subreddit_data[subreddit_name] = data
         
-        print(f"[r/{subreddit_name}] Loaded thresholds: {thresholds}")
+        print(f"[r/{subreddit_name}] Loaded thresholds: {data['thresholds']}")
         
         # --- Helper functions for this subreddit ---
         def get_ai_features(img):
@@ -149,7 +69,7 @@ Changes take effect immediately.
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             white_ratio = np.mean(gray > 240)
             
-            if white_threshold > white_threshold:
+            if white_ratio > white_threshold:
                 return True
             
             edges = cv2.Canny(gray, 100, 200)
@@ -390,109 +310,6 @@ Changes take effect immediately.
 
     # --- SHARED WORKER THREADS (one of each for ALL subreddits) ---
     
-    def shared_command_listener():
-        """Listen for threshold adjustment commands from moderators"""
-        processed_items = set()
-        
-        while True:
-            try:
-                with subreddit_data_lock:
-                    subreddits = list(subreddit_data.keys())
-                
-                for subreddit_name in subreddits:
-                    try:
-                        data = subreddit_data[subreddit_name]
-                        subreddit = data['subreddit']
-                        
-                        # Check mentions and replies to bot comments
-                        for mention in reddit.inbox.mentions(limit=25):
-                            if mention.id in processed_items:
-                                continue
-                            
-                            processed_items.add(mention.id)
-                            
-                            # Check if commenter is a moderator
-                            try:
-                                if not subreddit.moderator(mention.author)[0]:
-                                    continue
-                            except:
-                                continue
-                            
-                            body = mention.body.strip().lower()
-                            
-                            # Show current thresholds
-                            if '!showthresholds' in body:
-                                response = f"""**Current Threshold Settings for r/{subreddit_name}:**
-
-- hash_distance: {data['thresholds']['hash_distance']}
-- hash_ai_similarity: {data['thresholds']['hash_ai_similarity']}
-- orb_similarity: {data['thresholds']['orb_similarity']}
-- orb_ai_similarity: {data['thresholds']['orb_ai_similarity']}
-
-To adjust: `!setthreshold <parameter> <value>`
-To reset: `!resetthresholds`
-To edit directly: [View wiki config](https://reddit.com/r/{subreddit_name}/wiki/duplicatebot_config)"""
-                                mention.reply(response)
-                                print(f"[r/{subreddit_name}] Showed thresholds to {mention.author}")
-                            
-                            # Reset thresholds
-                            elif '!resetthresholds' in body:
-                                data['thresholds'] = DEFAULT_THRESHOLDS.copy()
-                                save_thresholds_to_wiki(subreddit, data['thresholds'])
-                                mention.reply(f"✅ Thresholds reset to defaults for r/{subreddit_name}")
-                                print(f"[r/{subreddit_name}] Thresholds reset by {mention.author}")
-                            
-                            # Set threshold
-                            elif '!setthreshold' in body:
-                                parts = body.split()
-                                if len(parts) >= 3:
-                                    param = parts[1].lower()
-                                    try:
-                                        value = float(parts[2])
-                                        
-                                        if param in data['thresholds']:
-                                            old_value = data['thresholds'][param]
-                                            data['thresholds'][param] = value
-                                            save_thresholds_to_wiki(subreddit, data['thresholds'])
-                                            mention.reply(f"✅ Updated `{param}` from `{old_value}` to `{value}` for r/{subreddit_name}")
-                                            print(f"[r/{subreddit_name}] Threshold {param} updated to {value} by {mention.author}")
-                                        else:
-                                            mention.reply(f"❌ Unknown parameter: `{param}`\n\nValid parameters: hash_distance, hash_ai_similarity, orb_similarity, orb_ai_similarity")
-                                    except ValueError:
-                                        mention.reply(f"❌ Invalid value. Please provide a number.")
-                                else:
-                                    mention.reply(f"❌ Usage: `!setthreshold <parameter> <value>`")
-                        
-                        # Check modmail
-                        for message in subreddit.modmail.conversations(state='new', limit=10):
-                            if message.id in processed_items:
-                                continue
-                            
-                            processed_items.add(message.id)
-                            
-                            # Similar command parsing for modmail
-                            # (implementation similar to above)
-                        
-                        # Periodically reload thresholds from wiki (in case edited directly)
-                        if time.time() - data['last_threshold_reload'] > 300:  # Every 5 minutes
-                            new_thresholds = load_thresholds_from_wiki(subreddit)
-                            if new_thresholds != data['thresholds']:
-                                data['thresholds'] = new_thresholds
-                                print(f"[r/{subreddit_name}] Reloaded thresholds from wiki: {new_thresholds}")
-                            data['last_threshold_reload'] = time.time()
-                        
-                        # Clean up old processed items
-                        if len(processed_items) > 1000:
-                            processed_items.clear()
-                    
-                    except Exception as e:
-                        print(f"[r/{subreddit_name}] Error in command listener: {e}")
-            
-            except Exception as e:
-                print(f"Error in shared command listener: {e}")
-            
-            time.sleep(10)
-    
     def shared_mod_log_monitor():
         """Single thread monitoring mod logs for ALL subreddits"""
         while True:
@@ -680,13 +497,14 @@ To edit directly: [View wiki config](https://reddit.com/r/{subreddit_name}/wiki/
             
             time.sleep(20)
     
-    # --- Accept invites and setup subreddits ---
-    def check_for_invites():
-        """Check for moderator invites and automatically accept them"""
+    # --- Accept invites and check for threshold adjustment messages ---
+    def check_for_invites_and_messages():
+        """Check for moderator invites and threshold adjustment messages"""
         while True:
             try:
-                # Check unread messages for mod invites
+                # Check unread messages for mod invites AND threshold commands
                 for message in reddit.inbox.unread(limit=None):
+                    # Handle mod invites
                     if "invitation to moderate" in message.subject.lower():
                         subreddit_name = message.subreddit.display_name
                         print(f"\n*** Found mod invite for r/{subreddit_name} ***")
@@ -697,6 +515,157 @@ To edit directly: [View wiki config](https://reddit.com/r/{subreddit_name}/wiki/
                         except Exception as e:
                             print(f"Error accepting invite for r/{subreddit_name}: {e}")
                         message.mark_read()
+                    
+                    # Handle threshold adjustment messages
+                    else:
+                        try:
+                            body = message.body.strip()
+                            body_lower = body.lower()
+                            author = message.author.name
+                            
+                            # Show current thresholds for a specific subreddit
+                            if '!showthresholds' in body_lower:
+                                parts = body_lower.split()
+                                
+                                # Check if subreddit was specified: !showthresholds r/pokemon
+                                if len(parts) >= 2 and parts[1].startswith('r/'):
+                                    target_subreddit = parts[1].replace('r/', '')
+                                    
+                                    # Verify subreddit exists in bot and user is a mod
+                                    if target_subreddit in subreddit_data:
+                                        target_data = subreddit_data[target_subreddit]
+                                        try:
+                                            if target_data['subreddit'].moderator(author):
+                                                response = f"""**Current Threshold Settings for r/{target_subreddit}:**
+
+- hash_distance: {target_data['thresholds']['hash_distance']}
+- hash_ai_similarity: {target_data['thresholds']['hash_ai_similarity']}
+- orb_similarity: {target_data['thresholds']['orb_similarity']}
+- orb_ai_similarity: {target_data['thresholds']['orb_ai_similarity']}
+
+To adjust: `!setthreshold r/{target_subreddit} <parameter> <value>`
+To reset: `!resetthresholds r/{target_subreddit}`"""
+                                                message.reply(response)
+                                                print(f"[r/{target_subreddit}] Showed thresholds to {author}")
+                                            else:
+                                                message.reply(f"❌ You are not a moderator of r/{target_subreddit}")
+                                        except:
+                                            message.reply(f"❌ You are not a moderator of r/{target_subreddit}")
+                                    else:
+                                        message.reply(f"❌ Bot is not running on r/{target_subreddit}")
+                                else:
+                                    # No subreddit specified - show usage
+                                    moderated_subs = []
+                                    for sub_name, sub_data in subreddit_data.items():
+                                        try:
+                                            if sub_data['subreddit'].moderator(author):
+                                                moderated_subs.append(sub_name)
+                                        except:
+                                            continue
+                                    
+                                    if moderated_subs:
+                                        subs_list = ', '.join([f"r/{s}" for s in moderated_subs])
+                                        message.reply(f"❌ Please specify a subreddit.\n\nUsage: `!showthresholds r/subredditname`\n\nYou moderate: {subs_list}")
+                                    else:
+                                        message.reply(f"❌ You do not moderate any subreddits where this bot is running.")
+                                
+                                message.mark_read()
+                            
+                            # Reset thresholds for a specific subreddit
+                            elif '!resetthresholds' in body_lower:
+                                parts = body_lower.split()
+                                
+                                # Check if subreddit was specified: !resetthresholds r/pokemon
+                                if len(parts) >= 2 and parts[1].startswith('r/'):
+                                    target_subreddit = parts[1].replace('r/', '')
+                                    
+                                    # Verify subreddit exists in bot and user is a mod
+                                    if target_subreddit in subreddit_data:
+                                        target_data = subreddit_data[target_subreddit]
+                                        try:
+                                            if target_data['subreddit'].moderator(author):
+                                                target_data['thresholds'] = DEFAULT_THRESHOLDS.copy()
+                                                message.reply(f"✅ Thresholds reset to defaults for r/{target_subreddit}")
+                                                print(f"[r/{target_subreddit}] Thresholds reset to defaults by {author}")
+                                                print(f"[r/{target_subreddit}] Current thresholds: {target_data['thresholds']}")
+                                            else:
+                                                message.reply(f"❌ You are not a moderator of r/{target_subreddit}")
+                                        except:
+                                            message.reply(f"❌ You are not a moderator of r/{target_subreddit}")
+                                    else:
+                                        message.reply(f"❌ Bot is not running on r/{target_subreddit}")
+                                else:
+                                    # No subreddit specified - show usage
+                                    moderated_subs = []
+                                    for sub_name, sub_data in subreddit_data.items():
+                                        try:
+                                            if sub_data['subreddit'].moderator(author):
+                                                moderated_subs.append(sub_name)
+                                        except:
+                                            continue
+                                    
+                                    if moderated_subs:
+                                        subs_list = ', '.join([f"r/{s}" for s in moderated_subs])
+                                        message.reply(f"❌ Please specify a subreddit.\n\nUsage: `!resetthresholds r/subredditname`\n\nYou moderate: {subs_list}")
+                                    else:
+                                        message.reply(f"❌ You do not moderate any subreddits where this bot is running.")
+                                
+                                message.mark_read()
+                            
+                            # Set threshold for a specific subreddit
+                            elif '!setthreshold' in body_lower:
+                                parts = body.split()  # Use original body for case-sensitive parameter names
+                                
+                                # Expected format: !setthreshold r/pokemon hash_distance 5
+                                if len(parts) >= 4 and parts[1].lower().startswith('r/'):
+                                    target_subreddit = parts[1].lower().replace('r/', '')
+                                    param = parts[2].lower()
+                                    
+                                    try:
+                                        value = float(parts[3])
+                                        
+                                        # Verify subreddit exists in bot and user is a mod
+                                        if target_subreddit in subreddit_data:
+                                            target_data = subreddit_data[target_subreddit]
+                                            try:
+                                                if target_data['subreddit'].moderator(author):
+                                                    if param in target_data['thresholds']:
+                                                        old_value = target_data['thresholds'][param]
+                                                        target_data['thresholds'][param] = value
+                                                        message.reply(f"✅ Updated `{param}` from `{old_value}` to `{value}` for r/{target_subreddit}")
+                                                        print(f"[r/{target_subreddit}] Threshold {param} updated: {old_value} → {value} by {author}")
+                                                        print(f"[r/{target_subreddit}] Current thresholds: {target_data['thresholds']}")
+                                                    else:
+                                                        message.reply(f"❌ Unknown parameter: `{param}`\n\nValid parameters: hash_distance, hash_ai_similarity, orb_similarity, orb_ai_similarity")
+                                                else:
+                                                    message.reply(f"❌ You are not a moderator of r/{target_subreddit}")
+                                            except:
+                                                message.reply(f"❌ You are not a moderator of r/{target_subreddit}")
+                                        else:
+                                            message.reply(f"❌ Bot is not running on r/{target_subreddit}")
+                                    
+                                    except ValueError:
+                                        message.reply(f"❌ Invalid value. Please provide a number.")
+                                else:
+                                    # Invalid format - show usage
+                                    moderated_subs = []
+                                    for sub_name, sub_data in subreddit_data.items():
+                                        try:
+                                            if sub_data['subreddit'].moderator(author):
+                                                moderated_subs.append(sub_name)
+                                        except:
+                                            continue
+                                    
+                                    if moderated_subs:
+                                        subs_list = ', '.join([f"r/{s}" for s in moderated_subs])
+                                        message.reply(f"❌ Usage: `!setthreshold r/subredditname <parameter> <value>`\n\nValid parameters: hash_distance, hash_ai_similarity, orb_similarity, orb_ai_similarity\n\nYou moderate: {subs_list}")
+                                    else:
+                                        message.reply(f"❌ You do not moderate any subreddits where this bot is running.")
+                                
+                                message.mark_read()
+                        
+                        except Exception as e:
+                            print(f"Error processing message: {e}")
             
                 # Also check for already accepted subreddits
                 for subreddit in reddit.user.moderator_subreddits(limit=None):
@@ -706,13 +675,12 @@ To edit directly: [View wiki config](https://reddit.com/r/{subreddit_name}/wiki/
                         setup_subreddit(subreddit_name)
             
             except Exception as e:
-                print(f"Error checking for invites: {e}")
+                print(f"Error checking for invites and messages: {e}")
         
             time.sleep(60)
     
-    # Start ONLY 6 shared worker threads (total, regardless of number of subreddits)
-    threading.Thread(target=check_for_invites, daemon=True).start()
-    threading.Thread(target=shared_command_listener, daemon=True).start()
+    # Start ONLY 5 shared worker threads (total, regardless of number of subreddits)
+    threading.Thread(target=check_for_invites_and_messages, daemon=True).start()
     threading.Thread(target=shared_mod_log_monitor, daemon=True).start()
     threading.Thread(target=shared_removal_checker, daemon=True).start()
     threading.Thread(target=shared_modqueue_worker, daemon=True).start()
@@ -720,7 +688,7 @@ To edit directly: [View wiki config](https://reddit.com/r/{subreddit_name}/wiki/
     
     # Keep main thread alive
     print("=== Multi-subreddit duplicate bot started ===")
-    print("Running with 6 shared worker threads for all subreddits")
-    print("Monitoring for mod invites and threshold commands...")
+    print("Running with 5 shared worker threads for all subreddits")
+    print("Monitoring for mod invites and threshold adjustment messages...")
     while True:
         time.sleep(3600)  # Keep alive
