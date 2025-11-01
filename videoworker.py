@@ -20,7 +20,8 @@ async def run_pokemon_duplicate_bot():
             'approved_by_moderator': set(),
             'ai_features': {},
             'repost_history': {},  # Track repost attempts: hash -> list of (author, title, date, utc, permalink)
-            'current_time': int(time.time())
+            'current_time': int(time.time()),
+            'currently_processing': set()  # Track submissions currently being processed
         }
         
         subreddit_data[subreddit_name] = data
@@ -282,6 +283,14 @@ async def run_pokemon_duplicate_bot():
 
         async def process_submission_for_duplicates(submission, context="stream"):
             """Main duplicate detection logic - works for both mod queue and stream"""
+            # Check if already being processed
+            if submission.id in data['currently_processing']:
+                print(f"[r/{subreddit_name}] Submission {submission.id} already being processed, skipping")
+                return False
+            
+            # Mark as currently processing
+            data['currently_processing'].add(submission.id)
+            
             try:
                 img, hash_value, descriptors, new_features = await load_and_process_image(submission.url)
                 data['ai_features'][submission.id] = new_features
@@ -316,6 +325,9 @@ async def run_pokemon_duplicate_bot():
             except Exception as e:
                 handle_exception(e)
                 return False
+            finally:
+                # Always remove from currently processing when done
+                data['currently_processing'].discard(submission.id)
 
         async def check_removed_original_posts():
             """Monitor for immediate removal detection using dual approach"""
