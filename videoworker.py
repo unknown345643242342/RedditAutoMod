@@ -1,62 +1,3 @@
-import asyncpraw
-import prawcore.exceptions
-import aiohttp
-import time
-from datetime import datetime
-import numpy as np
-from PIL import Image
-import imagehash
-import cv2
-import asyncio
-import traceback
-import openai
-from openai import OpenAI
-from torchvision import transforms
-import torch
-import torchvision.models as models
-import torchvision.transforms as T
-import hashlib
-import difflib as _difflib
-from datetime import datetime, timezone
-import tempfile
-import os
-
-# =========================
-# Crash-proof runner
-# =========================
-async def safe_run_async(target, *args, **kwargs):
-    """
-    Keeps a target async function running forever.
-    If the function raises, log the error, sleep briefly, and run it again.
-    """
-    while True:
-        try:
-            await target(*args, **kwargs)
-        except Exception as e:
-            print(f"[FATAL] {target.__name__} crashed: {e}")
-            traceback.print_exc()
-            await asyncio.sleep(10)  # brief cooldown before retrying
-
-# =========================
-# Reddit init + error handler
-# =========================
-async def initialize_reddit():
-    return asyncpraw.Reddit(
-        client_id='EdRh_0BZNsX0PwqXYrNbGA',
-        client_secret='zTNGq-dGk5HLf2oKxvT_iXIlzBX7kg',
-        username='DupliGuard',
-        password='Pokemon#1',
-        user_agent='testbot'
-    )
-
-def handle_exception(e):
-    if isinstance(e, prawcore.exceptions.ResponseException) and getattr(e, "response", None) and e.response.status_code == 429:
-        print("Rate limited by Reddit API. Ignoring error.")
-
-# =========================
-# Workers
-# =========================
-
 async def run_pokemon_duplicate_bot():
     reddit = await initialize_reddit()
     
@@ -542,9 +483,9 @@ async def run_pokemon_duplicate_bot():
                             print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
                             
                             if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                                await process_submission_for_duplicates(submission, context="stream")
-                                # Mark as processed to prevent double-processing
+                                # Mark as processed BEFORE processing to prevent race conditions
                                 data['processed_modqueue_submissions'].add(submission.id)
+                                await process_submission_for_duplicates(submission, context="stream")
 
                     data['current_time'] = int(time.time())
                 except Exception as e:
@@ -596,23 +537,3 @@ async def run_pokemon_duplicate_bot():
     print("Monitoring for mod invites...")
     while True:
         await asyncio.sleep(10)  # Keep alive
-        
-# =========================
-# Main: start async bot via safe_run
-# =========================
-if __name__ == "__main__":
-    async def main():
-        tasks = []
-        
-        async def add_task(name, func, *args, **kwargs):
-            task = asyncio.create_task(safe_run_async(func, *args, **kwargs))
-            tasks.append(task)
-            print(f"[STARTED] {name}")
-        
-        await add_task('run_pokemon_duplicate_bot_task', run_pokemon_duplicate_bot)
-        
-        # Keep the main coroutine alive indefinitely
-        while True:
-            await asyncio.sleep(30)
-    
-    asyncio.run(main())
