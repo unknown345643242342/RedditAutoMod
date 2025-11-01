@@ -250,7 +250,15 @@ async def run_pokemon_duplicate_bot():
 
         async def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink, matched_hash):
             """Remove duplicate and post comment if not approved"""
+            # Double-check this submission hasn't already been handled
+            if submission.id in data['processed_modqueue_submissions']:
+                print(f"[r/{subreddit_name}] Submission {submission.id} already processed, skipping duplicate removal")
+                return True
+            
             if not submission.approved:
+                # Mark as processed immediately to prevent duplicate removal
+                data['processed_modqueue_submissions'].add(submission.id)
+                
                 # Post comment first (before adding to history so current post isn't included)
                 await post_comment(submission, author, title, date, utc, status, permalink, matched_hash)
                 # Then add to history for future reposts
@@ -261,7 +269,15 @@ async def run_pokemon_duplicate_bot():
 
         async def handle_moderator_removed_repost(submission, hash_value):
             """Handle reposts of moderator-removed images"""
+            # Double-check this submission hasn't already been handled
+            if submission.id in data['processed_modqueue_submissions']:
+                print(f"[r/{subreddit_name}] Submission {submission.id} already processed, skipping mod-removed repost handling")
+                return True
+            
             if hash_value in data['moderator_removed_hashes'] and not submission.approved:
+                # Mark as processed immediately
+                data['processed_modqueue_submissions'].add(submission.id)
+                
                 original_submission = await reddit.submission(id=data['image_hashes'][hash_value][0])
                 # Post comment first (before adding to history)
                 await post_comment(
