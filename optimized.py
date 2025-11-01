@@ -28,10 +28,11 @@ def run_pokemon_duplicate_bot():
     
     def setup_subreddit(subreddit_name):
         """Initialize data structures for a specific subreddit (no new threads)"""
+        original_name = subreddit_name
         subreddit_name = subreddit_name.lower()  # Normalize to lowercase
         print(f"\n=== Setting up bot for r/{subreddit_name} ===")
         
-        subreddit = reddit.subreddit(subreddit_name)
+        subreddit = reddit.subreddit(original_name)
         
         # Create dedicated dictionaries for this subreddit
         data = {
@@ -670,7 +671,7 @@ To reset: `!resetthresholds r/{target_subreddit}`"""
             
                 # Also check for already accepted subreddits
                 for subreddit in reddit.user.moderator_subreddits(limit=None):
-                    subreddit_name = subreddit.display_name
+                    subreddit_name = subreddit.display_name.lower()
                     if subreddit_name not in subreddit_data:
                         print(f"\n*** Already moderating r/{subreddit_name}, setting up bot ***")
                         setup_subreddit(subreddit_name)
