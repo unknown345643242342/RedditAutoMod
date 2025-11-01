@@ -473,11 +473,13 @@ async def run_pokemon_duplicate_bot():
 
         # --- Stream new submissions ---
         async def stream_worker():
+            processed_in_stream = set()
             while True:
                 try:
                     async for submission in subreddit.stream.submissions(skip_existing=True):
                         if submission.created_utc > data['current_time'] and isinstance(submission, asyncpraw.models.Submission):
-                            if submission.id in data['processed_modqueue_submissions']:
+                            # Check if already processed in ANY context
+                            if submission.id in data['processed_modqueue_submissions'] or submission.id in processed_in_stream:
                                 continue
 
                             print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
@@ -485,6 +487,7 @@ async def run_pokemon_duplicate_bot():
                             if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                                 # Mark as processed BEFORE processing to prevent race conditions
                                 data['processed_modqueue_submissions'].add(submission.id)
+                                processed_in_stream.add(submission.id)
                                 await process_submission_for_duplicates(submission, context="stream")
 
                     data['current_time'] = int(time.time())
