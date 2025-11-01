@@ -16,12 +16,12 @@ async def run_pokemon_duplicate_bot():
             'image_hashes': {},
             'orb_descriptors': {},
             'moderator_removed_hashes': set(),
-            'processed_modqueue_submissions': set(),
+            'processed_submissions': set(),  # Single set to track ALL processed submissions
             'approved_by_moderator': set(),
             'ai_features': {},
-            'repost_history': {},  # Track repost attempts: hash -> list of (author, title, date, utc, permalink)
+            'repost_history': {},
             'current_time': int(time.time()),
-            'currently_processing': set()  # Track submissions currently being processed
+            'processing_lock': asyncio.Lock()  # Lock for critical sections
         }
         
         subreddit_data[subreddit_name] = data
@@ -154,7 +154,7 @@ async def run_pokemon_duplicate_bot():
                 datetime.utcfromtimestamp(submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
                 submission.created_utc,
                 submission.permalink,
-                "Removed (Repost)"  # Status for reposts
+                "Removed (Repost)"
             )
             data['repost_history'][matched_hash].append(repost_data)
 
@@ -249,37 +249,18 @@ async def run_pokemon_duplicate_bot():
             return False, None, None, None, None, None, None, None
 
         async def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink, matched_hash):
-            """Remove duplicate and post comment if not approved"""
-            # Double-check this submission hasn't already been handled
-            if submission.id in data['processed_modqueue_submissions']:
-                print(f"[r/{subreddit_name}] Submission {submission.id} already processed, skipping duplicate removal")
-                return True
-            
+            """Remove duplicate and post comment if not approved - PROTECTED by lock in caller"""
             if not submission.approved:
-                # Mark as processed immediately to prevent duplicate removal
-                data['processed_modqueue_submissions'].add(submission.id)
-                
-                # Post comment first (before adding to history so current post isn't included)
                 await post_comment(submission, author, title, date, utc, status, permalink, matched_hash)
-                # Then add to history for future reposts
                 add_to_repost_history(matched_hash, submission)
                 await submission.mod.remove()
                 print(f"[r/{subreddit_name}] Duplicate removed by {detection_method}: {submission.url}")
             return True
 
         async def handle_moderator_removed_repost(submission, hash_value):
-            """Handle reposts of moderator-removed images"""
-            # Double-check this submission hasn't already been handled
-            if submission.id in data['processed_modqueue_submissions']:
-                print(f"[r/{subreddit_name}] Submission {submission.id} already processed, skipping mod-removed repost handling")
-                return True
-            
+            """Handle reposts of moderator-removed images - PROTECTED by lock in caller"""
             if hash_value in data['moderator_removed_hashes'] and not submission.approved:
-                # Mark as processed immediately
-                data['processed_modqueue_submissions'].add(submission.id)
-                
                 original_submission = await reddit.submission(id=data['image_hashes'][hash_value][0])
-                # Post comment first (before adding to history)
                 await post_comment(
                     submission,
                     original_submission.author.name,
@@ -290,7 +271,6 @@ async def run_pokemon_duplicate_bot():
                     original_submission.permalink,
                     hash_value
                 )
-                # Then add to history
                 add_to_repost_history(hash_value, submission)
                 await submission.mod.remove()
                 print(f"[r/{subreddit_name}] Repost of a moderator-removed image removed: ", submission.url)
@@ -299,51 +279,58 @@ async def run_pokemon_duplicate_bot():
 
         async def process_submission_for_duplicates(submission, context="stream"):
             """Main duplicate detection logic - works for both mod queue and stream"""
-            # Check if already being processed
-            if submission.id in data['currently_processing']:
-                print(f"[r/{subreddit_name}] Submission {submission.id} already being processed, skipping")
+            # CRITICAL: Check if already processed BEFORE acquiring lock
+            if submission.id in data['processed_submissions']:
+                print(f"[r/{subreddit_name}] Submission {submission.id} already processed, skipping")
                 return False
             
-            # Mark as currently processing
-            data['currently_processing'].add(submission.id)
-            
-            try:
-                img, hash_value, descriptors, new_features = await load_and_process_image(submission.url)
-                data['ai_features'][submission.id] = new_features
+            # Acquire lock for the entire processing to prevent race conditions
+            async with data['processing_lock']:
+                # Double-check after acquiring lock (another task might have processed it)
+                if submission.id in data['processed_submissions']:
+                    print(f"[r/{subreddit_name}] Submission {submission.id} already processed (double-check), skipping")
+                    return False
                 
-                if await handle_moderator_removed_repost(submission, hash_value):
-                    return True
+                # Mark as processed IMMEDIATELY after lock acquisition
+                data['processed_submissions'].add(submission.id)
+                print(f"[r/{subreddit_name}] Processing submission {submission.id}")
                 
-                is_duplicate, author, title, date, utc, status, permalink, matched_hash = await check_hash_duplicate(
-                    submission, hash_value, new_features
-                )
-                if is_duplicate:
-                    return await handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink, matched_hash)
-                
-                is_duplicate, author, title, date, utc, status, permalink, matched_hash = await check_orb_duplicate(
-                    submission, descriptors, new_features
-                )
-                if is_duplicate:
-                    return await handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink, matched_hash)
-                
-                if hash_value not in data['image_hashes']:
-                    data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
-                    data['orb_descriptors'][submission.id] = descriptors
+                try:
+                    img, hash_value, descriptors, new_features = await load_and_process_image(submission.url)
                     data['ai_features'][submission.id] = new_features
-                    print(f"[r/{subreddit_name}] Stored new original: {submission.url}")
-                
-                if context == "modqueue" and not submission.approved:
-                    await submission.mod.approve()
-                    print(f"[r/{subreddit_name}] Original submission approved: ", submission.url)
-                
-                return False
-                
-            except Exception as e:
-                handle_exception(e)
-                return False
-            finally:
-                # Always remove from currently processing when done
-                data['currently_processing'].discard(submission.id)
+                    
+                    if await handle_moderator_removed_repost(submission, hash_value):
+                        return True
+                    
+                    is_duplicate, author, title, date, utc, status, permalink, matched_hash = await check_hash_duplicate(
+                        submission, hash_value, new_features
+                    )
+                    if is_duplicate:
+                        return await handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink, matched_hash)
+                    
+                    is_duplicate, author, title, date, utc, status, permalink, matched_hash = await check_orb_duplicate(
+                        submission, descriptors, new_features
+                    )
+                    if is_duplicate:
+                        return await handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink, matched_hash)
+                    
+                    if hash_value not in data['image_hashes']:
+                        data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
+                        data['orb_descriptors'][submission.id] = descriptors
+                        data['ai_features'][submission.id] = new_features
+                        print(f"[r/{subreddit_name}] Stored new original: {submission.url}")
+                    
+                    if context == "modqueue" and not submission.approved:
+                        await submission.mod.approve()
+                        print(f"[r/{subreddit_name}] Original submission approved: ", submission.url)
+                    
+                    return False
+                    
+                except Exception as e:
+                    handle_exception(e)
+                    # Remove from processed set on error so it can be retried
+                    data['processed_submissions'].discard(submission.id)
+                    return False
 
         async def check_removed_original_posts():
             """Monitor for immediate removal detection using dual approach"""
@@ -458,6 +445,8 @@ async def run_pokemon_duplicate_bot():
                             data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
                             data['orb_descriptors'][submission.id] = descriptors
                             data['ai_features'][submission.id] = features
+                            # Mark as processed during initial scan
+                            data['processed_submissions'].add(submission.id)
                     except Exception as e:
                         handle_exception(e)
         except Exception as e:
@@ -478,10 +467,6 @@ async def run_pokemon_duplicate_bot():
                         if not isinstance(submission, asyncpraw.models.Submission):
                             continue
                         
-                        # Skip if already processed by stream worker
-                        if submission.id in data['processed_modqueue_submissions']:
-                            continue
-                        
                         print(f"[r/{subreddit_name}] Scanning Mod Queue: ", submission.url)
                         
                         if submission.num_reports > 0:
@@ -492,8 +477,7 @@ async def run_pokemon_duplicate_bot():
                             continue
                         
                         if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                            is_duplicate = await process_submission_for_duplicates(submission, context="modqueue")
-                            data['processed_modqueue_submissions'].add(submission.id)
+                            await process_submission_for_duplicates(submission, context="modqueue")
 
                 except Exception as e:
                     handle_exception(e)
@@ -501,21 +485,13 @@ async def run_pokemon_duplicate_bot():
 
         # --- Stream new submissions ---
         async def stream_worker():
-            processed_in_stream = set()
             while True:
                 try:
                     async for submission in subreddit.stream.submissions(skip_existing=True):
                         if submission.created_utc > data['current_time'] and isinstance(submission, asyncpraw.models.Submission):
-                            # Check if already processed in ANY context
-                            if submission.id in data['processed_modqueue_submissions'] or submission.id in processed_in_stream:
-                                continue
-
                             print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
                             
                             if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                                # Mark as processed BEFORE processing to prevent race conditions
-                                data['processed_modqueue_submissions'].add(submission.id)
-                                processed_in_stream.add(submission.id)
                                 await process_submission_for_duplicates(submission, context="stream")
 
                     data['current_time'] = int(time.time())
