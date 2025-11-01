@@ -28,6 +28,7 @@ def run_pokemon_duplicate_bot():
     
     def setup_subreddit(subreddit_name):
         """Initialize data structures for a specific subreddit (no new threads)"""
+        subreddit_name = subreddit_name.lower()  # Normalize to lowercase
         print(f"\n=== Setting up bot for r/{subreddit_name} ===")
         
         subreddit = reddit.subreddit(subreddit_name)
@@ -529,7 +530,7 @@ def run_pokemon_duplicate_bot():
                                 
                                 # Check if subreddit was specified: !showthresholds r/pokemon
                                 if len(parts) >= 2 and parts[1].startswith('r/'):
-                                    target_subreddit = parts[1].replace('r/', '')
+                                    target_subreddit = parts[1].replace('r/', '').lower()
                                     
                                     # Verify subreddit exists in bot and user is a mod
                                     if target_subreddit in subreddit_data:
@@ -577,7 +578,7 @@ To reset: `!resetthresholds r/{target_subreddit}`"""
                                 
                                 # Check if subreddit was specified: !resetthresholds r/pokemon
                                 if len(parts) >= 2 and parts[1].startswith('r/'):
-                                    target_subreddit = parts[1].replace('r/', '')
+                                    target_subreddit = parts[1].replace('r/', '').lower()
                                     
                                     # Verify subreddit exists in bot and user is a mod
                                     if target_subreddit in subreddit_data:
