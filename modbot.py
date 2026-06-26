@@ -588,7 +588,7 @@ def run_pokemon_duplicate_bot():
                 for subreddit_name, data in _snapshot_subreddits():
                     try:
                         submissions = sorted(
-                            (s for s in data['subreddit'].mod.modqueue(only='submission', limit=None)
+                            (s for s in data['subreddit'].mod.modqueue(only='submissions', limit=None)
                              if isinstance(s, praw.models.Submission)),
                             key=lambda x: x.created_utc,
                         )
@@ -669,7 +669,7 @@ def run_pokemon_duplicate_bot():
         If Reddit routes the invitation through its actual chat system
         (s.reddit.com, separate from the standard API) PRAW cannot see or accept
         it at all.  Accept it manually in the Reddit UI; the
-        moderator_subreddits() loop (Strategy 2 below) will automatically pick
+        me().moderated() loop (Strategy 2 below) will automatically pick
         it up on the next polling cycle and launch setup in the background.
         """
         seen_ids = set()
@@ -742,10 +742,12 @@ def run_pokemon_duplicate_bot():
                 if len(seen_ids) > 500:
                     seen_ids.clear()
 
-                # Strategy 2 — moderator_subreddits() fallback.
+                # Strategy 2 — me().moderated() fallback.
                 # Catches subreddits where the invite was accepted manually, or by
                 # Strategy 1, or that existed before this bot run.
-                for subreddit in reddit.user.moderator_subreddits(limit=None):
+                # reddit.user.moderator_subreddits() was removed in PRAW 7.2.0;
+                # the replacement is Redditor.moderated() on the authenticated user.
+                for subreddit in reddit.user.me().moderated():
                     _spawn_setup(subreddit.display_name)
 
             except Exception as e:
