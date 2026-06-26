@@ -479,7 +479,7 @@ def run_pokemon_duplicate_bot():
         # Initial scan
         print(f"[r/{subreddit_name}] Starting initial scan...")
         try:
-            for submission in subreddit.new(limit=20000):
+            for submission in subreddit.new(limit=20):
                 if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                     print(f"[r/{subreddit_name}] Indexing (initial scan): {submission.url}")
                     try:
@@ -611,75 +611,47 @@ def run_pokemon_duplicate_bot():
                 handle_exception(e)
             time.sleep(20)
 
-    def check_for_invites():
-        seen_ids = set()
-        setup_in_progress = set()
-
-        def _launch_setup(name):
-            if name in subreddit_data or name in setup_in_progress:
-                return
+    def _spawn_setup(name):
+        if name in subreddit_data:
+            return
+        def _run():
             try:
-                get_reddit().subreddit(name).mod.accept_invite()
-                print(f"✅ Accepted mod invite for r/{name}")
-            except prawcore.exceptions.NotFound:
-                print(f"[invite] No pending invite for r/{name} — already accepted or revoked.")
-                return
-            except prawcore.exceptions.Forbidden:
-                print(f"[invite] Forbidden for r/{name} — accept manually in the Reddit UI.")
-                return
+                setup_subreddit(name)
             except Exception as e:
-                print(f"[invite] Error accepting r/{name}: {e}")
-                return
-            _spawn_setup(name)
+                print(f"[setup] Error initializing {name}: {e}")
+        threading.Thread(target=_run, daemon=True).start()
+        print(f"[invite] Setup thread started for r/{name}")
 
-        def _spawn_setup(name):
-            if name in subreddit_data or name in setup_in_progress:
-                return
-            setup_in_progress.add(name)
-            def _run():
-                try:
-                    setup_subreddit(name)
-                finally:
-                    setup_in_progress.discard(name)
-            threading.Thread(target=_run, daemon=True).start()
-            print(f"[invite] Setup thread started for r/{name}")
-
+    def check_for_invites():
+        """Checks the bot's inbox for moderator invitations and accepts them."""
+        reddit = get_reddit()
         while True:
             try:
-                for fetch_fn in (get_reddit().inbox.unread, get_reddit().inbox.messages):
-                    for message in fetch_fn(limit=50):
-                        if message.id in seen_ids:
-                            continue
-                        seen_ids.add(message.id)
-                        if "invitation to moderate" not in message.subject.lower():
-                            continue
-
-                        match = re.search(r'/r/([A-Za-z0-9_]+)', message.subject)
-                        if match:
-                            subreddit_name = match.group(1)
-                        elif getattr(message, 'subreddit', None):
-                            subreddit_name = message.subreddit.display_name
-                        else:
-                            print(f"[invite] Could not extract subreddit from: {message.subject!r}")
-                            continue
-
-                        print(f"\n*** Found mod invite for r/{subreddit_name} ***")
-                        _launch_setup(subreddit_name)
-
-                        try:
-                            message.mark_read()
-                        except Exception:
-                            pass
-
-                if len(seen_ids) > 500:
-                    seen_ids.clear()
-
+                # 1. Iterate through unread messages in the bot's inbox
+                for message in reddit.inbox.unread(limit=50):
+                    # 2. Verify the item is a private message
+                    if isinstance(message, praw.models.Message) and "invitation to moderate" in message.subject.lower():
+                        # 3. Ensure PRAW attached the Subreddit object to the message
+                        if message.subreddit:
+                            try:
+                                # Accept the invitation directly
+                                message.subreddit.mod.accept_invite()
+                                print(f"✅ Accepted invite to moderate r/{message.subreddit.display_name}")
+                                # Mark the message as read
+                                message.mark_read()
+                                # Trigger setup for the new subreddit
+                                _spawn_setup(message.subreddit.display_name)
+                            except Exception as e:
+                                print(f"Failed to accept invite for r/{message.subreddit.display_name}: {e}")
+                
+                # Check current moderated subs as a backup
                 for subreddit in get_reddit().user.me().moderated():
-                    _spawn_setup(subreddit.display_name)
+                    if subreddit.display_name not in subreddit_data:
+                        _spawn_setup(subreddit.display_name)
 
             except Exception as e:
                 handle_exception(e)
-            time.sleep(60)
+            
 
     for target in (check_for_invites, shared_mod_log_monitor, shared_removal_checker,
                    shared_modqueue_worker, shared_stream_worker):
