@@ -629,27 +629,64 @@ def run_pokemon_duplicate_bot():
 
     def check_for_invites():
         """
-        Fixed: message.mark_read() was outside the `if` block in the original,
-        silently marking ALL unread messages (not just mod invites) as read.
+        Detects and accepts moderator invitations, then sets up any subreddit the
+        bot moderates.
+
+        WHY TWO INBOX CHECKS:
+        Reddit's newer UI displays mod invitations in a 'Chat Requests' section.
+        When Reddit renders a message this way it often auto-marks it as read
+        before PRAW polls the inbox, so inbox.unread() silently misses it.
+        Scanning inbox.messages() (all recent messages, read or not) covers this
+        gap. A seen_ids set prevents double-processing the same message from
+        both fetches.
+
+        HARD LIMIT — true chat invitations:
+        If Reddit routes the invitation through its chat system (a separate API at
+        s.reddit.com, not the standard messages API) PRAW cannot see or accept it
+        at all.  In that case the invite must be accepted manually in the Reddit
+        UI.  The moderator_subreddits() loop below will then automatically detect
+        the newly accepted subreddit on the next polling cycle and call
+        setup_subreddit() without any manual bot intervention.
         """
+        seen_ids = set()
         while True:
             try:
-                for message in reddit.inbox.unread(limit=None):
-                    if "invitation to moderate" in message.subject.lower():
+                # Strategy 1 — inbox scan (unread + recent read messages).
+                # Iterating both ensures we catch invitations that Reddit has
+                # already flipped to "read" before we polled.
+                for fetch_fn in (reddit.inbox.unread, reddit.inbox.messages):
+                    for message in fetch_fn(limit=25):
+                        if message.id in seen_ids:
+                            continue
+                        seen_ids.add(message.id)
+                        if "invitation to moderate" not in message.subject.lower():
+                            continue
                         subreddit_name = message.subreddit.display_name
                         print(f"\n*** Found mod invite for r/{subreddit_name} ***")
-                        try:
-                            message.subreddit.mod.accept_invite()
-                            print(f"✅ Accepted mod invite for r/{subreddit_name}")
-                            setup_subreddit(subreddit_name)
-                        except Exception as e:
-                            print(f"Error accepting invite for r/{subreddit_name}: {e}")
-                        message.mark_read()  # now inside the if block
+                        if subreddit_name not in subreddit_data:
+                            try:
+                                message.subreddit.mod.accept_invite()
+                                print(f"✅ Accepted mod invite for r/{subreddit_name}")
+                                setup_subreddit(subreddit_name)
+                            except Exception as e:
+                                print(f"[invite] Error accepting r/{subreddit_name}: {e}")
+                        message.mark_read()
 
+                # Prevent seen_ids from growing without bound over long uptimes.
+                if len(seen_ids) > 500:
+                    seen_ids.clear()
+
+                # Strategy 2 — moderator_subreddits() fallback.
+                # Catches subreddits where:
+                #   • the invite was accepted manually via the Reddit UI, or
+                #   • the invite arrived via Reddit's true chat API (invisible to
+                #     PRAW) and was accepted manually, or
+                #   • Strategy 1 already accepted it this cycle.
                 for subreddit in reddit.user.moderator_subreddits(limit=None):
                     if subreddit.display_name not in subreddit_data:
                         print(f"\n*** Already moderating r/{subreddit.display_name}, setting up ***")
                         setup_subreddit(subreddit.display_name)
+
             except Exception as e:
                 handle_exception(e)
             time.sleep(60)
