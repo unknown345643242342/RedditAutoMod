@@ -22,7 +22,6 @@ DATE_FMT = '%Y-%m-%d %H:%M:%S'
 
 # =========================
 # Modqueue action thresholds
-# Pulled to module level so they are defined once and shared across workers.
 # =========================
 APPROVE_THRESHOLDS = {
     'This is misinformation': 1,
@@ -51,7 +50,7 @@ SUBMISSION_REMOVE_THRESHOLDS = {
 }
 
 # =========================
-# Reddit init
+# Reddit init & Thread Safety
 # =========================
 def initialize_reddit():
     return praw.Reddit(
@@ -62,9 +61,16 @@ def initialize_reddit():
         user_agent='testbot',
     )
 
+_thread_local = threading.local()
+
+def get_reddit():
+    """Returns a thread-local PRAW instance to prevent Session collisions."""
+    if not hasattr(_thread_local, 'reddit'):
+        _thread_local.reddit = initialize_reddit()
+    return _thread_local.reddit
+
 # =========================
 # Error handling
-# Now logs all exception types, not just 429.
 # =========================
 def handle_exception(e):
     if isinstance(e, prawcore.exceptions.ResponseException) and getattr(e, "response", None) and e.response.status_code == 429:
@@ -86,17 +92,23 @@ def safe_run(target, *args, **kwargs):
 
 # =========================
 # Module-level image utility
-# Extracts the repeated requests.get + cv2.imdecode pattern into one place.
 # =========================
 def _fetch_image(url):
     """Fetch an image URL and return it as an OpenCV BGR array."""
-    raw = requests.get(url, timeout=10).content
-    return cv2.imdecode(np.asarray(bytearray(raw), dtype=np.uint8), cv2.IMREAD_COLOR)
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status() # Throws exception on 404/500
+        
+        img = cv2.imdecode(np.asarray(bytearray(resp.content), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("cv2.imdecode returned None (invalid or corrupted image format).")
+        return img
+    except Exception as e:
+        print(f"[WARN] Failed to fetch or decode image {url}: {e}")
+        return None
 
 # =========================
 # Module-level data eviction
-# Replaces two different ad-hoc cleanup patterns (del + dict-comprehension)
-# with a single consistent helper using .pop().
 # =========================
 def _evict_submission(data, submission_id, hash_value=None):
     """Remove a submission's entries from all per-subreddit data stores."""
@@ -116,7 +128,7 @@ def _evict_submission(data, submission_id, hash_value=None):
 # =========================
 
 def monitor_reported_posts():
-    reddit = initialize_reddit()
+    reddit = get_reddit()
     subreddit = reddit.subreddit(SUBREDDIT_NAME)
     while True:
         try:
@@ -131,7 +143,7 @@ def monitor_reported_posts():
 
 def handle_modqueue_items():
     """Timer-based auto-approval for posts with exactly one report after one hour."""
-    reddit = initialize_reddit()
+    reddit = get_reddit()
     timers = {}
     while True:
         try:
@@ -149,31 +161,32 @@ def handle_modqueue_items():
                         except prawcore.exceptions.ServerError as se:
                             handle_exception(se)
                     else:
-                        # The original dead comparison (new_reports != new_reports) was always
-                        # False, so only the else branch ever ran. Dead code removed.
                         time_remaining = int(timers[item.id] + 3600 - time.time())
-                        print(f"Time remaining for post {item.id}: {time_remaining} seconds")
+                        if time_remaining % 300 == 0:  # Only print every 5 minutes to avoid log spam
+                            print(f"Time remaining for post {item.id}: {time_remaining} seconds")
         except Exception as e:
             handle_exception(e)
             time.sleep(60)
 
 
 def handle_spoiler_status():
-    reddit = initialize_reddit()
+    reddit = get_reddit()
     subreddit = reddit.subreddit(SUBREDDIT_NAME)
     previous_spoiler_status = {}
+    
     while True:
         try:
+            # Fetch mods ONCE per cycle to prevent rate-limiting loop
+            mod_names = {mod.name for mod in subreddit.moderator()}
+            
             for submission in subreddit.new():
                 if submission.id not in previous_spoiler_status:
                     previous_spoiler_status[submission.id] = submission.spoiler
                     continue
 
                 if previous_spoiler_status[submission.id] != submission.spoiler:
-                    try:
-                        is_moderator = submission.author in subreddit.moderator()
-                    except Exception:
-                        is_moderator = False
+                    # Guard against deleted users (author is None)
+                    is_moderator = bool(submission.author and submission.author.name in mod_names)
 
                     if not submission.spoiler:
                         if not is_moderator:
@@ -192,17 +205,9 @@ def handle_spoiler_status():
 
 def process_modqueue():
     """
-    Consolidated replacement for four previously separate functions:
-      - handle_user_reports_and_removal     (comment removal)
-      - handle_comments_based_on_approval   (comment approval)
-      - handle_submissions_based_on_user_reports (submission approval)
-      - handle_posts_based_on_removal       (submission removal)
-
-    One modqueue API call per cycle processes all four actions in a single pass,
-    reducing API calls from 4 concurrent threads to 1.
-    Approval applies to any item type; removal is type-specific.
+    Consolidated replacement for all modqueue approval/removal functions.
     """
-    reddit = initialize_reddit()
+    reddit = get_reddit()
     while True:
         try:
             for item in reddit.subreddit(SUBREDDIT_NAME).mod.modqueue(limit=100):
@@ -233,11 +238,10 @@ def process_modqueue():
 # Duplicate detection bot
 # =========================
 def run_pokemon_duplicate_bot():
-    reddit = initialize_reddit()
     subreddit_data = {}
     subreddit_data_lock = threading.Lock()
 
-    # --- AI models: initialized once for the whole bot, not once per subreddit ---
+    # --- AI models: initialized once for the whole bot ---
     device = "cpu"
     efficientnet_model = models.efficientnet_b0(pretrained=True)
     efficientnet_model.eval()
@@ -250,8 +254,7 @@ def run_pokemon_duplicate_bot():
     orb_detector = cv2.ORB_create()
     bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    # --- Shared helpers: defined once here, close over models above.
-    #     Previously redefined on every setup_subreddit() call. ---
+    # --- Shared helpers ---
 
     def get_ai_features(img):
         try:
@@ -266,18 +269,6 @@ def run_pokemon_duplicate_bot():
             return None
 
     def _get_orb_input(img):
-        """
-        Single-pass image preparation for ORB detection.
-
-        Replaces three separate functions and their combined redundant work:
-          - is_problematic_image:         computed gray, sometimes computed Canny
-          - preprocess_image_for_orb:     recomputed gray, recomputed Canny on masked image
-          - get_orb_descriptors_conditional: recomputed gray a third time for the normal path
-
-        Now: gray is computed exactly once. Canny is computed at most twice
-        (once to measure edge density, once on the thresholded image when needed).
-        For normal images, cvtColor is called once instead of three times.
-        """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         # Predominantly white (screenshots, document scans)
@@ -329,9 +320,12 @@ def run_pokemon_duplicate_bot():
 
     def setup_subreddit(subreddit_name):
         print(f"\n=== Setting up bot for r/{subreddit_name} ===")
+        reddit = get_reddit()
         subreddit = reddit.subreddit(subreddit_name)
+        
+        # Storing subreddit_name as string to prevent sharing PRAW instance
         data = {
-            'subreddit': subreddit,
+            'subreddit_name': subreddit_name,
             'image_hashes': {},
             'orb_descriptors': {},
             'moderator_removed_hashes': set(),
@@ -345,35 +339,31 @@ def run_pokemon_duplicate_bot():
         with subreddit_data_lock:
             subreddit_data[subreddit_name] = data
 
-        # Per-subreddit helpers close over subreddit_name, data, and reddit.
-
         def load_and_process_image(url):
             """Load image; compute hash, ORB descriptors, and AI features."""
             img = _fetch_image(url)
+            if img is None:
+                raise ValueError(f"Unprocessable image from {url}")
+            
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             hash_value = str(imagehash.phash(Image.fromarray(gray)))
             print(f"[r/{subreddit_name}] Generated hash: {hash_value}")
             return img, hash_value, get_orb_descriptors(img), get_ai_features(img)
 
         def get_cached_ai_features(submission_id):
-            """Return cached AI features, or compute and cache them.
-            Fixed: previously reimplemented _fetch_image inline instead of reusing it."""
+            """Return cached AI features, or compute and cache them."""
             if submission_id in data['ai_features']:
                 return data['ai_features'][submission_id]
-            old_submission = reddit.submission(id=submission_id)
+            # Thread-local reddit object to avoid cross-thread collision
+            old_submission = get_reddit().submission(id=submission_id)
             features = get_ai_features(_fetch_image(old_submission.url))
             data['ai_features'][submission_id] = features
             return features
 
         def _build_original_info(original_submission, hash_value=None):
-            """
-            Build the 6-tuple of display info for an original post.
-            Replaces three copies of the same date-formatting + status-check block
-            in check_hash_duplicate, check_orb_duplicate, and
-            handle_moderator_removed_repost.
-            """
+            """Build the 6-tuple of display info for an original post."""
             return (
-                original_submission.author.name,
+                original_submission.author.name if original_submission.author else "[Deleted]",
                 original_submission.title,
                 datetime.utcfromtimestamp(original_submission.created_utc).strftime(DATE_FMT),
                 original_submission.created_utc,
@@ -416,7 +406,7 @@ def run_pokemon_duplicate_bot():
             if submission.id == original_id or submission.created_utc <= original_time:
                 return False, None, None, None, None, None, None
 
-            original_submission = reddit.submission(id=original_id)
+            original_submission = get_reddit().submission(id=original_id)
             ai_score = calculate_ai_similarity(new_features, get_cached_ai_features(original_id))
             print(f"[r/{subreddit_name}] Hash match. AI similarity: {ai_score:.2f}")
 
@@ -430,14 +420,13 @@ def run_pokemon_duplicate_bot():
                     ai_score = calculate_ai_similarity(new_features, get_cached_ai_features(old_id))
                     if ai_score > 0.75:
                         print(f"[r/{subreddit_name}] ORB duplicate. AI similarity: {ai_score:.2f}")
-                        original_submission = reddit.submission(id=old_id)
+                        original_submission = get_reddit().submission(id=old_id)
                         old_hash = next((h for h, v in data['image_hashes'].items() if v[0] == old_id), None)
                         return (True,) + _build_original_info(original_submission, old_hash)
             return False, None, None, None, None, None, None
 
         def handle_duplicate(submission, detection_method, author, title, date, utc, status, permalink):
-            """Remove duplicate and post comment.
-            Removed the unused `is_hash_dup` boolean parameter from the original."""
+            """Remove duplicate and post comment."""
             if not submission.approved:
                 submission.mod.remove()
                 post_comment(submission, author, title, date, utc, status, permalink)
@@ -447,7 +436,7 @@ def run_pokemon_duplicate_bot():
         def handle_moderator_removed_repost(submission, hash_value):
             if hash_value in data['moderator_removed_hashes'] and not submission.approved:
                 submission.mod.remove()
-                original_submission = reddit.submission(id=data['image_hashes'][hash_value][0])
+                original_submission = get_reddit().submission(id=data['image_hashes'][hash_value][0])
                 post_comment(submission, *_build_original_info(original_submission, hash_value))
                 print(f"[r/{subreddit_name}] Repost of mod-removed image removed: {submission.url}")
                 return True
@@ -455,14 +444,12 @@ def run_pokemon_duplicate_bot():
 
         def process_submission_for_duplicates(submission, context="stream"):
             try:
-                # `img` (first return value) was unused in the original; underscore makes that explicit.
                 _, hash_value, descriptors, new_features = load_and_process_image(submission.url)
                 data['ai_features'][submission.id] = new_features
 
                 if handle_moderator_removed_repost(submission, hash_value):
                     return True
 
-                # Replaced two copy-pasted check+unpack+handle blocks with a loop.
                 checks = [
                     ("hash + AI", lambda: check_hash_duplicate(submission, hash_value, new_features)),
                     ("ORB + AI",  lambda: check_orb_duplicate(submission, descriptors, new_features)),
@@ -510,17 +497,15 @@ def run_pokemon_duplicate_bot():
         print(f"[r/{subreddit_name}] Bot setup complete!\n")
 
     # --- Shared worker threads ---
-    # Replaced four repeated copies of:
-    #   with subreddit_data_lock: subreddits = list(subreddit_data.keys())
-    #   for subreddit_name in subreddits: try: ... except: print(...)
-    # with a single _snapshot_subreddits() call in each worker.
 
     def shared_mod_log_monitor():
         while True:
             try:
                 for subreddit_name, data in _snapshot_subreddits():
                     try:
-                        for log_entry in data['subreddit'].mod.log(action='removelink', limit=50):
+                        # Instantiate local Subreddit with Thread Local instance
+                        local_sub = get_reddit().subreddit(data['subreddit_name'])
+                        for log_entry in local_sub.mod.log(action='removelink', limit=50):
                             if log_entry.id in data['processed_log_items']:
                                 continue
                             data['processed_log_items'].add(log_entry.id)
@@ -562,9 +547,7 @@ def run_pokemon_duplicate_bot():
                         checked = 0
                         for hash_value, submission_id in recent + medium[:20] + old[:10]:
                             try:
-                                if reddit.submission(id=submission_id).author is None:
-                                    # Uses shared _evict_submission helper instead of
-                                    # the original's mix of del-with-guard and dict comprehension.
+                                if get_reddit().submission(id=submission_id).author is None:
                                     _evict_submission(data, submission_id, hash_value)
                                     print(f"[r/{subreddit_name}] [USER DELETE] {submission_id} removed from index.")
                                 else:
@@ -587,8 +570,9 @@ def run_pokemon_duplicate_bot():
             try:
                 for subreddit_name, data in _snapshot_subreddits():
                     try:
+                        local_sub = get_reddit().subreddit(data['subreddit_name'])
                         submissions = sorted(
-                            (s for s in data['subreddit'].mod.modqueue(only='submissions', limit=None)
+                            (s for s in local_sub.mod.modqueue(only='submissions', limit=None)
                              if isinstance(s, praw.models.Submission)),
                             key=lambda x: x.created_utc,
                         )
@@ -596,8 +580,6 @@ def run_pokemon_duplicate_bot():
                             print(f"[r/{subreddit_name}] Scanning modqueue: {submission.url}")
                             if submission.num_reports > 0:
                                 print(f"[r/{subreddit_name}] Skipping reported image: {submission.url}")
-                                # Uses shared _evict_submission instead of ad-hoc dict
-                                # comprehension + .pop() combo that also missed last_checked.
                                 _evict_submission(data, submission.id)
                                 continue
                             if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
@@ -614,7 +596,8 @@ def run_pokemon_duplicate_bot():
             try:
                 for subreddit_name, data in _snapshot_subreddits():
                     try:
-                        for submission in data['subreddit'].new(limit=10):
+                        local_sub = get_reddit().subreddit(data['subreddit_name'])
+                        for submission in local_sub.new(limit=10):
                             if (submission.created_utc > data['current_time']
                                     and isinstance(submission, praw.models.Submission)
                                     and submission.id not in data['processed_modqueue_submissions']):
@@ -629,59 +612,14 @@ def run_pokemon_duplicate_bot():
             time.sleep(20)
 
     def check_for_invites():
-        """
-        Detects and accepts moderator invitations, then sets up any subreddit the
-        bot moderates.
-
-        ROOT CAUSE OF THE ORIGINAL BUG — setup_subreddit was synchronous:
-        setup_subreddit() scans up to 20,000 posts on first run, which can block
-        this loop for many minutes.  Any invite that arrived during that window
-        would only be checked after the scan finished, and could easily be pushed
-        past the message fetch limit by inbox activity in the interim.  Fix:
-        setup_subreddit() is now launched in a background thread so this loop
-        always returns to polling within the 60-second sleep interval.
-
-        setup_in_progress guards against launching a second setup thread for the
-        same subreddit during the brief window before setup_subreddit() adds the
-        subreddit to subreddit_data.
-
-        WHY TWO INBOX CHECKS:
-        Reddit's newer UI displays mod invitations in a 'Chat Requests' section.
-        When Reddit renders a message this way it often auto-marks it as read
-        before PRAW polls the inbox, so inbox.unread() silently misses it.
-        Scanning inbox.messages() (all recent messages, read or not) covers this
-        gap.  A seen_ids set deduplicates across both fetches.
-
-        WHY WE PARSE THE SUBJECT INSTEAD OF USING message.subreddit:
-        For chat-request-style invitation messages, message.subreddit is
-        unreliable — PRAW can build a subreddit reference that points to the
-        wrong context, causing accept_invite() to return 404.  The subject line
-        always contains the canonical name as plain text
-        ("invitation to moderate /r/Name"), so we extract it with a regex and
-        construct a fresh subreddit object ourselves.
-
-        WHY mark_read() IS ISOLATED:
-        Chat-type messages return 403 Forbidden when mark_read() is called via
-        the standard messages API.  We let that fail silently so it never aborts
-        the invite-handling block.
-
-        HARD LIMIT — true chat invitations:
-        If Reddit routes the invitation through its actual chat system
-        (s.reddit.com, separate from the standard API) PRAW cannot see or accept
-        it at all.  Accept it manually in the Reddit UI; the
-        me().moderated() loop (Strategy 2 below) will automatically pick
-        it up on the next polling cycle and launch setup in the background.
-        """
         seen_ids = set()
         setup_in_progress = set()
 
         def _launch_setup(name):
-            """Accept the moderator invite for `name`, then kick off setup in a
-            background thread so check_for_invites is never blocked."""
             if name in subreddit_data or name in setup_in_progress:
                 return
             try:
-                reddit.subreddit(name).mod.accept_invite()
+                get_reddit().subreddit(name).mod.accept_invite()
                 print(f"✅ Accepted mod invite for r/{name}")
             except prawcore.exceptions.NotFound:
                 print(f"[invite] No pending invite for r/{name} — already accepted or revoked.")
@@ -695,7 +633,6 @@ def run_pokemon_duplicate_bot():
             _spawn_setup(name)
 
         def _spawn_setup(name):
-            """Launch setup_subreddit in a background thread if not already running."""
             if name in subreddit_data or name in setup_in_progress:
                 return
             setup_in_progress.add(name)
@@ -709,8 +646,7 @@ def run_pokemon_duplicate_bot():
 
         while True:
             try:
-                # Strategy 1 — inbox scan (unread + recent read messages).
-                for fetch_fn in (reddit.inbox.unread, reddit.inbox.messages):
+                for fetch_fn in (get_reddit().inbox.unread, get_reddit().inbox.messages):
                     for message in fetch_fn(limit=50):
                         if message.id in seen_ids:
                             continue
@@ -718,8 +654,6 @@ def run_pokemon_duplicate_bot():
                         if "invitation to moderate" not in message.subject.lower():
                             continue
 
-                        # Parse subreddit name from subject — more reliable than
-                        # message.subreddit for chat-style invitation messages.
                         match = re.search(r'/r/([A-Za-z0-9_]+)', message.subject)
                         if match:
                             subreddit_name = match.group(1)
@@ -732,29 +666,21 @@ def run_pokemon_duplicate_bot():
                         print(f"\n*** Found mod invite for r/{subreddit_name} ***")
                         _launch_setup(subreddit_name)
 
-                        # mark_read() raises 403 on chat-type messages — isolate it.
                         try:
                             message.mark_read()
                         except Exception:
                             pass
 
-                # Prevent seen_ids growing without bound over long uptimes.
                 if len(seen_ids) > 500:
                     seen_ids.clear()
 
-                # Strategy 2 — me().moderated() fallback.
-                # Catches subreddits where the invite was accepted manually, or by
-                # Strategy 1, or that existed before this bot run.
-                # reddit.user.moderator_subreddits() was removed in PRAW 7.2.0;
-                # the replacement is Redditor.moderated() on the authenticated user.
-                for subreddit in reddit.user.me().moderated():
+                for subreddit in get_reddit().user.me().moderated():
                     _spawn_setup(subreddit.display_name)
 
             except Exception as e:
                 handle_exception(e)
             time.sleep(60)
 
-    # Start all 5 shared worker threads via a loop instead of 5 repeated calls.
     for target in (check_for_invites, shared_mod_log_monitor, shared_removal_checker,
                    shared_modqueue_worker, shared_stream_worker):
         threading.Thread(target=target, daemon=True).start()
@@ -768,8 +694,6 @@ def run_pokemon_duplicate_bot():
 
 # =========================
 # Main: start threads via safe_run
-# Reduced from 8 threads to 5: the four separate modqueue workers are now
-# the single process_modqueue thread.
 # =========================
 if __name__ == "__main__":
     threads = {}
