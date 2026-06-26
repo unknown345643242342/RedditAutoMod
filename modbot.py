@@ -1,6 +1,7 @@
 import praw
 import prawcore.exceptions
 import requests
+import re
 import time
 from datetime import datetime, timezone
 import numpy as np
@@ -637,23 +638,32 @@ def run_pokemon_duplicate_bot():
         When Reddit renders a message this way it often auto-marks it as read
         before PRAW polls the inbox, so inbox.unread() silently misses it.
         Scanning inbox.messages() (all recent messages, read or not) covers this
-        gap. A seen_ids set prevents double-processing the same message from
-        both fetches.
+        gap.  A seen_ids set deduplicates across both fetches.
+
+        WHY WE PARSE THE SUBJECT INSTEAD OF USING message.subreddit:
+        For chat-request-style invitation messages, message.subreddit is
+        unreliable — PRAW can build a subreddit reference that points to the
+        wrong context, causing accept_invite() to return 404 (no pending invite
+        found).  The subject line always contains the canonical subreddit name as
+        plain text ("invitation to moderate /r/Name"), so we extract it with a
+        regex and construct a fresh subreddit object ourselves.
+
+        WHY mark_read() IS ISOLATED:
+        Chat-type messages are not part of the standard Reddit messages API.
+        Calling mark_read() on one returns 403 Forbidden.  We let that fail
+        silently rather than aborting the whole invite-handling block.
 
         HARD LIMIT — true chat invitations:
-        If Reddit routes the invitation through its chat system (a separate API at
-        s.reddit.com, not the standard messages API) PRAW cannot see or accept it
-        at all.  In that case the invite must be accepted manually in the Reddit
-        UI.  The moderator_subreddits() loop below will then automatically detect
-        the newly accepted subreddit on the next polling cycle and call
-        setup_subreddit() without any manual bot intervention.
+        If Reddit routes the invitation through its actual chat system
+        (s.reddit.com, separate from the standard API) PRAW cannot see or accept
+        it at all.  Accept it manually in the Reddit UI; the
+        moderator_subreddits() loop (Strategy 2 below) will automatically pick
+        it up on the next polling cycle.
         """
         seen_ids = set()
         while True:
             try:
                 # Strategy 1 — inbox scan (unread + recent read messages).
-                # Iterating both ensures we catch invitations that Reddit has
-                # already flipped to "read" before we polled.
                 for fetch_fn in (reddit.inbox.unread, reddit.inbox.messages):
                     for message in fetch_fn(limit=25):
                         if message.id in seen_ids:
@@ -661,27 +671,53 @@ def run_pokemon_duplicate_bot():
                         seen_ids.add(message.id)
                         if "invitation to moderate" not in message.subject.lower():
                             continue
-                        subreddit_name = message.subreddit.display_name
+
+                        # Parse subreddit name from the subject line.
+                        # "invitation to moderate /r/SubName" is the standard format.
+                        # This is more reliable than message.subreddit for chat-style
+                        # messages, which was causing the 404.
+                        match = re.search(r'/r/([A-Za-z0-9_]+)', message.subject)
+                        if match:
+                            subreddit_name = match.group(1)
+                        elif getattr(message, 'subreddit', None):
+                            subreddit_name = message.subreddit.display_name
+                        else:
+                            print(f"[invite] Could not extract subreddit name from: {message.subject!r}")
+                            continue
+
                         print(f"\n*** Found mod invite for r/{subreddit_name} ***")
                         if subreddit_name not in subreddit_data:
                             try:
-                                message.subreddit.mod.accept_invite()
+                                # Use reddit.subreddit() directly — NOT message.subreddit —
+                                # to guarantee a clean, correctly-scoped object.
+                                reddit.subreddit(subreddit_name).mod.accept_invite()
                                 print(f"✅ Accepted mod invite for r/{subreddit_name}")
                                 setup_subreddit(subreddit_name)
+                            except prawcore.exceptions.NotFound:
+                                # 404: no pending invite exists (already accepted,
+                                # revoked, or the subject parse picked the wrong name).
+                                print(f"[invite] No pending invite found for r/{subreddit_name} — already accepted or revoked.")
+                            except prawcore.exceptions.Forbidden:
+                                # 403: bot lacks modself scope or invite was
+                                # delivered via chat and must be accepted manually.
+                                print(f"[invite] Forbidden for r/{subreddit_name} — accept manually in the Reddit UI.")
                             except Exception as e:
                                 print(f"[invite] Error accepting r/{subreddit_name}: {e}")
-                        message.mark_read()
 
-                # Prevent seen_ids from growing without bound over long uptimes.
+                        # mark_read() raises 403 on chat-type messages; isolate it
+                        # so that failure here never blocks the invite acceptance above.
+                        try:
+                            message.mark_read()
+                        except Exception:
+                            pass
+
+                # Prevent seen_ids growing without bound over long uptimes.
                 if len(seen_ids) > 500:
                     seen_ids.clear()
 
                 # Strategy 2 — moderator_subreddits() fallback.
-                # Catches subreddits where:
-                #   • the invite was accepted manually via the Reddit UI, or
-                #   • the invite arrived via Reddit's true chat API (invisible to
-                #     PRAW) and was accepted manually, or
-                #   • Strategy 1 already accepted it this cycle.
+                # Catches subreddits where the invite was accepted manually or by
+                # Strategy 1, and any that existed before this run of the bot.
                 for subreddit in reddit.user.moderator_subreddits(limit=None):
                     if subreddit.display_name not in subreddit_data:
                         print(f"\n*** Already moderating r/{subreddit.display_name}, setting up ***")
