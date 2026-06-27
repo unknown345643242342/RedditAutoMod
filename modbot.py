@@ -17,11 +17,16 @@ import torchvision.transforms as T
 # =========================
 # Constants
 # =========================
-SUBREDDIT_NAME = 'PokeLeaks'
+# SUBREDDIT_NAME removed — all workers now operate on every subreddit
+# the bot moderates, discovered automatically via Reddit's 'mod' aggregator
+# and reddit.user.me().moderated().
 DATE_FMT = '%Y-%m-%d %H:%M:%S'
 
 # =========================
 # Modqueue action thresholds
+# NOTE: These rules are applied to ALL moderated subreddits.
+# If you need per-subreddit rules, convert these into a dict keyed by
+# subreddit name, e.g. APPROVE_THRESHOLDS = {'PokeLeaks': {...}, ...}
 # =========================
 APPROVE_THRESHOLDS = {
     'This is misinformation': 1,
@@ -124,62 +129,100 @@ def _evict_submission(data, submission_id, hash_value=None):
     data['last_checked'].pop(submission_id, None)
 
 # =========================
+# Helper: subreddit name from item
+# =========================
+def _sub_name(item):
+    """Safely extract the display name of a post/comment's subreddit."""
+    sub = getattr(item, 'subreddit', None)
+    if sub is None:
+        return 'unknown'
+    return getattr(sub, 'display_name', str(sub))
+
+# =========================
 # Workers
 # =========================
 
 def monitor_reported_posts():
+    """
+    Monitors reported posts across ALL moderated subreddits.
+    Uses reddit.subreddit('mod') which is PRAW's built-in aggregator
+    that streams data from every subreddit the bot moderates.
+    """
     reddit = get_reddit()
-    subreddit = reddit.subreddit(SUBREDDIT_NAME)
+    subreddit = reddit.subreddit('mod')  # 'mod' = all moderated subreddits
     while True:
         try:
             for post in subreddit.mod.reports():
                 if getattr(post, "approved", False):
                     post.mod.approve()
-                    print(f"Post {post.id} has been approved again")
+                    print(f"[r/{_sub_name(post)}] Post {post.id} has been approved again")
         except Exception as e:
             handle_exception(e)
             time.sleep(60)
 
 
 def handle_modqueue_items():
-    """Timer-based auto-approval for posts with exactly one report after one hour."""
+    """
+    Timer-based auto-approval for posts with exactly one report after one hour.
+    Operates across ALL moderated subreddits via the 'mod' aggregator.
+    """
     reddit = get_reddit()
     timers = {}
     while True:
         try:
-            for item in reddit.subreddit(SUBREDDIT_NAME).mod.modqueue():
+            for item in reddit.subreddit('mod').mod.modqueue():
+                sub = _sub_name(item)
                 if getattr(item, "num_reports", 0) == 1 and item.id not in timers:
                     timers[item.id] = time.time()
-                    print(f"Starting timer for post {item.id} (created {getattr(item, 'created_utc', time.time())})...")
+                    print(f"[r/{sub}] Starting timer for post {item.id} (created {getattr(item, 'created_utc', time.time())})...")
 
                 if item.id in timers:
                     if time.time() - timers[item.id] >= 3600:
                         try:
                             item.mod.approve()
-                            print(f"Approved post {item.id} with one report")
+                            print(f"[r/{sub}] Approved post {item.id} with one report")
                             del timers[item.id]
                         except prawcore.exceptions.ServerError as se:
                             handle_exception(se)
                     else:
                         time_remaining = int(timers[item.id] + 3600 - time.time())
                         if time_remaining % 300 == 0:  # Only print every 5 minutes to avoid log spam
-                            print(f"Time remaining for post {item.id}: {time_remaining} seconds")
+                            print(f"[r/{sub}] Time remaining for post {item.id}: {time_remaining} seconds")
         except Exception as e:
             handle_exception(e)
             time.sleep(60)
 
 
 def handle_spoiler_status():
+    """
+    Enforces spoiler tags across ALL moderated subreddits.
+    Moderator lists are cached per-subreddit (refreshed every 5 minutes)
+    to avoid hammering the API while still catching mod roster changes.
+    """
     reddit = get_reddit()
-    subreddit = reddit.subreddit(SUBREDDIT_NAME)
     previous_spoiler_status = {}
-    
+    mod_cache = {}          # subreddit_name -> frozenset of mod usernames
+    mod_cache_time = {}     # subreddit_name -> last fetch timestamp
+    MOD_CACHE_TTL = 300     # re-fetch mod list every 5 minutes
+
     while True:
         try:
-            # Fetch mods ONCE per cycle to prevent rate-limiting loop
-            mod_names = {mod.name for mod in subreddit.moderator()}
-            
-            for submission in subreddit.new():
+            for submission in reddit.subreddit('mod').new():
+                sub_name = _sub_name(submission)
+                now = time.time()
+
+                # Refresh mod list if missing or stale
+                if sub_name not in mod_cache or now - mod_cache_time.get(sub_name, 0) > MOD_CACHE_TTL:
+                    try:
+                        mod_cache[sub_name] = {mod.name for mod in reddit.subreddit(sub_name).moderator()}
+                        mod_cache_time[sub_name] = now
+                    except Exception as e:
+                        handle_exception(e)
+                        # Keep previous cache on error rather than clearing it
+                        mod_cache.setdefault(sub_name, set())
+
+                mod_names = mod_cache.get(sub_name, set())
+
                 if submission.id not in previous_spoiler_status:
                     previous_spoiler_status[submission.id] = submission.spoiler
                     continue
@@ -191,12 +234,12 @@ def handle_spoiler_status():
                     if not submission.spoiler:
                         if not is_moderator:
                             try:
-                                print(f'Post {submission.id} unmarked as spoiler by non-mod. Re-marking.')
+                                print(f'[r/{sub_name}] Post {submission.id} unmarked as spoiler by non-mod. Re-marking.')
                                 submission.mod.spoiler()
                             except prawcore.exceptions.ServerError as se:
                                 handle_exception(se)
                         else:
-                            print(f'Post {submission.id} unmarked as spoiler by a moderator. Leaving as-is.')
+                            print(f'[r/{sub_name}] Post {submission.id} unmarked as spoiler by a moderator. Leaving as-is.')
                     previous_spoiler_status[submission.id] = submission.spoiler
         except Exception as e:
             handle_exception(e)
@@ -205,12 +248,14 @@ def handle_spoiler_status():
 
 def process_modqueue():
     """
-    Consolidated replacement for all modqueue approval/removal functions.
+    Consolidated approval/removal handler for modqueue items.
+    Operates across ALL moderated subreddits via the 'mod' aggregator.
     """
     reddit = get_reddit()
     while True:
         try:
-            for item in reddit.subreddit(SUBREDDIT_NAME).mod.modqueue(limit=100):
+            for item in reddit.subreddit('mod').mod.modqueue(limit=100):
+                sub = _sub_name(item)
                 user_reports = getattr(item, "user_reports", None)
                 if not user_reports:
                     continue
@@ -220,13 +265,13 @@ def process_modqueue():
                     if reason in APPROVE_THRESHOLDS and count >= APPROVE_THRESHOLDS[reason]:
                         item.mod.approve()
                         label = getattr(item, 'title', None) or getattr(item, 'body', str(item))
-                        print(f'Item "{label}" approved: {count}× "{reason}"')
+                        print(f'[r/{sub}] Item "{label}" approved: {count}× "{reason}"')
                     elif isinstance(item, praw.models.Comment) and reason in COMMENT_REMOVE_THRESHOLDS and count >= COMMENT_REMOVE_THRESHOLDS[reason]:
                         item.mod.remove()
-                        print(f'Comment "{item.body}" removed: {count}× "{reason}"')
+                        print(f'[r/{sub}] Comment "{item.body}" removed: {count}× "{reason}"')
                     elif isinstance(item, praw.models.Submission) and reason in SUBMISSION_REMOVE_THRESHOLDS and count >= SUBMISSION_REMOVE_THRESHOLDS[reason]:
                         item.mod.remove()
-                        print(f'Submission "{item.title}" removed: {count}× "{reason}"')
+                        print(f'[r/{sub}] Submission "{item.title}" removed: {count}× "{reason}"')
                 except prawcore.exceptions.ServerError as se:
                     handle_exception(se)
         except Exception as e:
@@ -479,7 +524,7 @@ def run_pokemon_duplicate_bot():
         # Initial scan
         print(f"[r/{subreddit_name}] Starting initial scan...")
         try:
-            for submission in subreddit.new(limit=20000):
+            for submission in subreddit.new(limit=20):
                 if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                     print(f"[r/{subreddit_name}] Indexing (initial scan): {submission.url}")
                     try:
@@ -609,51 +654,77 @@ def run_pokemon_duplicate_bot():
                         handle_exception(e)
             except Exception as e:
                 handle_exception(e)
-            time.sleep(20)
-
-    def _spawn_setup(name):
-        if name in subreddit_data:
-            return
-        def _run():
-            try:
-                setup_subreddit(name)
-            except Exception as e:
-                print(f"[setup] Error initializing {name}: {e}")
-        threading.Thread(target=_run, daemon=True).start()
-        print(f"[invite] Setup thread started for r/{name}")
+            time.sleep(5)
 
     def check_for_invites():
-        """Checks the bot's inbox for moderator invitations and accepts them."""
-        reddit = get_reddit()
+        seen_ids = set()
+        setup_in_progress = set()
+
+        def _launch_setup(name):
+            if name in subreddit_data or name in setup_in_progress:
+                return
+            try:
+                get_reddit().subreddit(name).mod.accept_invite()
+                print(f"✅ Accepted mod invite for r/{name}")
+            except prawcore.exceptions.NotFound:
+                print(f"[invite] No pending invite for r/{name} — already accepted or revoked.")
+                return
+            except prawcore.exceptions.Forbidden:
+                print(f"[invite] Forbidden for r/{name} — accept manually in the Reddit UI.")
+                return
+            except Exception as e:
+                print(f"[invite] Error accepting r/{name}: {e}")
+                return
+            _spawn_setup(name)
+
+        def _spawn_setup(name):
+            if name in subreddit_data or name in setup_in_progress:
+                return
+            setup_in_progress.add(name)
+            def _run():
+                try:
+                    setup_subreddit(name)
+                finally:
+                    setup_in_progress.discard(name)
+            threading.Thread(target=_run, daemon=True).start()
+            print(f"[invite] Setup thread started for r/{name}")
+
         while True:
             try:
-                # 1. Iterate through unread messages in the bot's inbox
-                for message in reddit.inbox.unread(limit=50):
-                    # 2. Verify the item is a private message
-                    if isinstance(message, praw.models.Message) and "invitation to moderate" in message.subject.lower():
-                        # 3. Ensure PRAW attached the Subreddit object to the message
-                        if message.subreddit:
-                            try:
-                                # Accept the invitation directly
-                                message.subreddit.mod.accept_invite()
-                                print(f"✅ Accepted invite to moderate r/{message.subreddit.display_name}")
-                                # Mark the message as read
-                                message.mark_read()
-                                # Trigger setup for the new subreddit
-                                _spawn_setup(message.subreddit.display_name)
-                            except Exception as e:
-                                print(f"Failed to accept invite for r/{message.subreddit.display_name}: {e}")
-                
-                # Check current moderated subs as a backup
+                for fetch_fn in (get_reddit().inbox.unread, get_reddit().inbox.messages):
+                    for message in fetch_fn(limit=50):
+                        if message.id in seen_ids:
+                            continue
+                        seen_ids.add(message.id)
+                        if "invitation to moderate" not in message.subject.lower():
+                            continue
+
+                        match = re.search(r'/r/([A-Za-z0-9_]+)', message.subject)
+                        if match:
+                            subreddit_name = match.group(1)
+                        elif getattr(message, 'subreddit', None):
+                            subreddit_name = message.subreddit.display_name
+                        else:
+                            print(f"[invite] Could not extract subreddit from: {message.subject!r}")
+                            continue
+
+                        print(f"\n*** Found mod invite for r/{subreddit_name} ***")
+                        _launch_setup(subreddit_name)
+
+                        try:
+                            message.mark_read()
+                        except Exception:
+                            pass
+
+                if len(seen_ids) > 500:
+                    seen_ids.clear()
+
                 for subreddit in get_reddit().user.me().moderated():
-                    if subreddit.display_name not in subreddit_data:
-                        _spawn_setup(subreddit.display_name)
+                    _spawn_setup(subreddit.display_name)
 
             except Exception as e:
                 handle_exception(e)
-            
-            # Check every 5 minutes
-            time.sleep(300)
+            time.sleep(5)
 
     for target in (check_for_invites, shared_mod_log_monitor, shared_removal_checker,
                    shared_modqueue_worker, shared_stream_worker):
