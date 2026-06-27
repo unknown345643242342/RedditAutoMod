@@ -515,7 +515,7 @@ def run_pokemon_duplicate_bot():
         # --- Initial scan ---
         print(f"[r/{subreddit_name}] Starting initial scan...")
         try:
-            for submission in subreddit.new(limit=20000):
+            for submission in subreddit.new(limit=20):
                 if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
                     print(f"[r/{subreddit_name}] Indexing submission (initial scan): ", submission.url)
                     try:
@@ -721,25 +721,53 @@ def run_pokemon_duplicate_bot():
             
             time.sleep(20)
     
-    # Start ONLY 4 shared worker threads (total, regardless of number of subreddits)
+    def sync_moderated_subreddits():
+        """
+        Background thread that runs every 5 minutes to:
+          1. Accept any pending moderator invites from the inbox.
+          2. Sync all currently moderated subreddits into the registry,
+             so newly accepted invites automatically start receiving full bot coverage.
+        """
+        while True:
+            try:
+                # --- Step 1: Accept pending mod invites ---
+                for message in reddit.inbox.unread(limit=None):
+                    if "invitation to moderate" in message.subject.lower():
+                        if hasattr(message, 'subreddit') and message.subreddit:
+                            try:
+                                message.subreddit.mod.accept_invite()
+                                print(f"[REGISTRY] Accepted invite to r/{message.subreddit.display_name}")
+                                message.mark_read()
+                            except Exception as e:
+                                print(f"[REGISTRY] Failed to accept invite for r/{message.subreddit.display_name}: {e}")
+
+                # --- Step 2: Sync all moderated subreddits into the registry ---
+                for sub in reddit.user.moderator_subreddits(limit=None):
+                    with subreddit_data_lock:
+                        already_registered = sub.display_name in subreddit_data
+                    if not already_registered:
+                        print(f"[REGISTRY] Registering new subreddit: r/{sub.display_name}")
+                        threading.Thread(
+                            target=setup_subreddit,
+                            args=(sub.display_name,),
+                            daemon=True
+                        ).start()
+
+            except Exception as e:
+                print(f"[REGISTRY] Sync thread error: {e}")
+
+            time.sleep(300)  # Check every 5 minutes
+
+    # Start 5 shared worker threads (total, regardless of number of subreddits)
     threading.Thread(target=shared_mod_log_monitor, daemon=True).start()
     threading.Thread(target=shared_removal_checker, daemon=True).start()
     threading.Thread(target=shared_modqueue_worker, daemon=True).start()
     threading.Thread(target=shared_stream_worker, daemon=True).start()
-
-    # Discover and set up all currently moderated subreddits at startup
-    print("=== Discovering moderated subreddits ===")
-    try:
-        for sub in reddit.user.moderator_subreddits(limit=None):
-            subreddit_name = sub.display_name
-            print(f"Queuing setup for r/{subreddit_name}...")
-            threading.Thread(target=setup_subreddit, args=(subreddit_name,), daemon=True).start()
-    except Exception as e:
-        print(f"Error discovering moderated subreddits: {e}")
+    threading.Thread(target=sync_moderated_subreddits, daemon=True).start()
 
     # Keep main thread alive
     print("=== Multi-subreddit duplicate bot started ===")
-    print("Running with 4 shared worker threads for all subreddits")
+    print("Running with 5 shared worker threads for all subreddits")
     while True:
         time.sleep(20)  # Keep alive
         
