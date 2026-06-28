@@ -110,17 +110,20 @@ def parse_markdown_table(content):
 
 def sync_subreddit_rules_and_config(subreddit):
     """
-    Pulls subreddit rules, manages the bot_report_thresholds wiki page using Markdown tables.
-    Only writes to the wiki if a rule is added or removed.
-    Updates memory immediately if a moderator changes a threshold on the wiki.
+    Pulls subreddit rules, manages the bot_report_thresholds wiki page.
+    Robustly handles wiki page creation using PRAW 7.8.2.
     """
     wiki_page_name = "bot_report_thresholds"
+    wiki = subreddit.wiki
     
+    # 1. Attempt to fetch existing page
     try:
-        page = subreddit.wiki[wiki_page_name]
+        page = wiki[wiki_page_name]
         content = page.content_md
+        is_new_page = False
     except prawcore.exceptions.NotFound:
         content = ""
+        is_new_page = True
     except Exception as e:
         print(f"[r/{subreddit.display_name}] Error accessing wiki: {e}")
         return
@@ -150,10 +153,9 @@ def sync_subreddit_rules_and_config(subreddit):
     current_rules = list(dict.fromkeys(current_rules))
     
     # Check if we actually need to rewrite the wiki page
-    # (Only needed if a rule was added, removed, or renamed)
     existing_rules_set = set(existing_config.keys())
     current_rules_set = set(current_rules)
-    needs_wiki_update = (content == "") or (existing_rules_set != current_rules_set)
+    needs_wiki_update = is_new_page or (existing_rules_set != current_rules_set)
 
     # Build the target configuration
     new_config = {}
@@ -163,9 +165,9 @@ def sync_subreddit_rules_and_config(subreddit):
         else:
             new_config[rule] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
 
-    # Only edit the wiki if the rule structure changed
+    # Handle wiki update/creation
     if needs_wiki_update:
-        new_content = [
+        new_content_lines = [
             "### Automated Bot Action Thresholds",
             "Set the integer value to the **number of reports needed** to trigger the action.",
             "Set to `0` to completely disable an action for a specific rule.",
@@ -176,26 +178,28 @@ def sync_subreddit_rules_and_config(subreddit):
         
         for rule in current_rules:
             cfg = new_config[rule]
-            new_content.append(f"| {rule} | {cfg['post_remove']} | {cfg['post_approve']} | {cfg['comment_remove']} | {cfg['comment_approve']} |")
+            new_content_lines.append(f"| {rule} | {cfg['post_remove']} | {cfg['post_approve']} | {cfg['comment_remove']} | {cfg['comment_approve']} |")
             
-        final_wiki_text = "\n".join(new_content)
+        final_wiki_text = "\n".join(new_content_lines)
         
-        # Final safety check to prevent redundant writes
+        # Only commit to Reddit if content has changed (or if it's a new page)
         if final_wiki_text.strip() != content.strip():
             try:
-                page = subreddit.wiki[wiki_page_name]
-                page.edit(final_wiki_text, reason="Syncing updated subreddit rules to bot thresholds")
-                if content == "":
-                    # First time setup, ensure it's hidden to moderators only
-                    page.mod.update(listed=False, permlevel=2)
-                print(f"[r/{subreddit.display_name}] Updated {wiki_page_name} wiki page (Rule structure changed).")
+                target_page = wiki[wiki_page_name]
+                target_page.edit(content=final_wiki_text, reason="Syncing updated subreddit rules to bot thresholds")
+                
+                # If we just created it, set the privacy settings
+                if is_new_page:
+                    target_page.mod.update(listed=False, permlevel=2)
+                    print(f"[r/{subreddit.display_name}] Successfully created wiki page '{wiki_page_name}'.")
+                else:
+                    print(f"[r/{subreddit.display_name}] Updated {wiki_page_name} wiki page.")
             except Exception as e:
-                print(f"[r/{subreddit.display_name}] Error updating wiki config page: {e}")
+                print(f"[r/{subreddit.display_name}] CRITICAL: Failed to write to wiki: {e}")
 
     # Synchronize Internal Memory safely
     with subreddit_configs_lock:
         current_memory_config = subreddit_configs.get(subreddit.display_name, {})
-        
         if current_memory_config != new_config:
             subreddit_configs[subreddit.display_name] = new_config
             print(f"[r/{subreddit.display_name}] Internal bot thresholds updated and synchronized.")
