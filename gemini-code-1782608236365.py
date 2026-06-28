@@ -57,7 +57,7 @@ def handle_exception(e):
 subreddit_data = {}
 subreddit_data_lock = threading.Lock()
 
-# New global for holding dynamic wiki configurations
+# Global for holding dynamic wiki configurations
 subreddit_configs = {}
 subreddit_configs_lock = threading.Lock()
 
@@ -78,7 +78,7 @@ bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 # =========================
 def get_action_threshold(subreddit_name, rule_reason, action_type):
     """Safely fetch the numerical threshold for a specific rule and action."""
-    safe_reason = str(rule_reason).replace('|', '-') # Protect against table breaks
+    safe_reason = str(rule_reason).replace('|', '-').strip()
     with subreddit_configs_lock:
         subs = subreddit_configs.get(subreddit_name, {})
     return subs.get(safe_reason, {}).get(action_type, 0)
@@ -110,8 +110,9 @@ def parse_markdown_table(content):
 
 def sync_subreddit_rules_and_config(subreddit):
     """
-    Pulls subreddit rules, manages the bot_report_thresholds wiki page using Markdown tables,
-    syncs changes, and caches the thresholds into memory.
+    Pulls subreddit rules, manages the bot_report_thresholds wiki page using Markdown tables.
+    Only writes to the wiki if a rule is added or removed.
+    Updates memory immediately if a moderator changes a threshold on the wiki.
     """
     wiki_page_name = "bot_report_thresholds"
     
@@ -139,32 +140,31 @@ def sync_subreddit_rules_and_config(subreddit):
     try:
         for r in subreddit.rules()['rules']:
             if r.get('short_name'):
-                current_rules.append(r['short_name'].replace('|', '-'))
+                current_rules.append(r['short_name'].replace('|', '-').strip())
             if r.get('violation_reason'):
-                current_rules.append(r['violation_reason'].replace('|', '-'))
+                current_rules.append(r['violation_reason'].replace('|', '-').strip())
     except Exception as e:
         print(f"[r/{subreddit.display_name}] Could not fetch rules: {e}")
 
     # Remove duplicates while preserving order
     current_rules = list(dict.fromkeys(current_rules))
     
-    new_config = {}
-    changed = False
+    # Check if we actually need to rewrite the wiki page
+    # (Only needed if a rule was added, removed, or renamed)
+    existing_rules_set = set(existing_config.keys())
+    current_rules_set = set(current_rules)
+    needs_wiki_update = (content == "") or (existing_rules_set != current_rules_set)
 
-    # Check for new rules or copy existing data
+    # Build the target configuration
+    new_config = {}
     for rule in current_rules:
         if rule in existing_config:
             new_config[rule] = existing_config[rule]
         else:
             new_config[rule] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
-            changed = True
 
-    # Detect if any old rules were deleted from the subreddit
-    if len(existing_config) != len(new_config):
-        changed = True
-
-    # If the rules changed or the page is missing, push an updated table to Reddit
-    if changed or content == "":
+    # Only edit the wiki if the rule structure changed
+    if needs_wiki_update:
         new_content = [
             "### Automated Bot Action Thresholds",
             "Set the integer value to the **number of reports needed** to trigger the action.",
@@ -180,19 +180,25 @@ def sync_subreddit_rules_and_config(subreddit):
             
         final_wiki_text = "\n".join(new_content)
         
-        try:
-            page = subreddit.wiki[wiki_page_name]
-            page.edit(final_wiki_text, reason="Syncing updated subreddit rules to bot thresholds")
-            if content == "":
-                # First time setup, ensure it's hidden to moderators only
-                page.mod.update(listed=False, permlevel=2)
-            print(f"[r/{subreddit.display_name}] Updated {wiki_page_name} wiki page.")
-        except Exception as e:
-            print(f"[r/{subreddit.display_name}] Error updating wiki config page: {e}")
+        # Final safety check to prevent redundant writes
+        if final_wiki_text.strip() != content.strip():
+            try:
+                page = subreddit.wiki[wiki_page_name]
+                page.edit(final_wiki_text, reason="Syncing updated subreddit rules to bot thresholds")
+                if content == "":
+                    # First time setup, ensure it's hidden to moderators only
+                    page.mod.update(listed=False, permlevel=2)
+                print(f"[r/{subreddit.display_name}] Updated {wiki_page_name} wiki page (Rule structure changed).")
+            except Exception as e:
+                print(f"[r/{subreddit.display_name}] Error updating wiki config page: {e}")
 
-    # Load the verified rules into memory for the bot to use
+    # Synchronize Internal Memory safely
     with subreddit_configs_lock:
-        subreddit_configs[subreddit.display_name] = new_config
+        current_memory_config = subreddit_configs.get(subreddit.display_name, {})
+        
+        if current_memory_config != new_config:
+            subreddit_configs[subreddit.display_name] = new_config
+            print(f"[r/{subreddit.display_name}] Internal bot thresholds updated and synchronized.")
 
 # =========================
 # Standalone Sync Function
@@ -237,7 +243,8 @@ def sync_moderated_subreddits():
         except Exception as e:
             print(f"[REGISTRY] Sync thread error: {e}")
 
-        time.sleep(300)  # Check every 5 minutes
+        # FIXED: Run cycle exactly every 5 minutes (300 seconds)
+        time.sleep(300) 
 
 
 # =========================
