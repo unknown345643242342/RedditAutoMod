@@ -380,7 +380,7 @@ def sync_moderated_subreddits():
         except Exception as e:
             print(f"[REGISTRY] Sync thread error: {e}")
 
-        time.sleep(300)  # Check every 5 minutes
+        time.sleep(5)  # Check every 5 minutes
 
 # =========================
 # Workers
@@ -438,31 +438,46 @@ def handle_spoiler_status():
 
     while True:
         try:
-            for submission in reddit.subreddit('mod').new():
+            # We fetch recent submissions from the aggregated mod feed
+            for submission in reddit.subreddit('mod').new(limit=100):
                 sub_name = submission.subreddit.display_name
+                
+                # First time seeing this submission, record its status
                 if submission.id not in previous_spoiler_status:
                     previous_spoiler_status[submission.id] = submission.spoiler
                     continue
 
-                if previous_spoiler_status[submission.id] != submission.spoiler:
+                # Detect if the status changed from True to False (unspoilered)
+                if previous_spoiler_status[submission.id] and not submission.spoiler:
+                    mod_unspoilered = False
+                    
                     try:
-                        is_moderator = submission.author in submission.subreddit.moderator()
-                    except Exception:
-                        is_moderator = False
+                        # Check the last 5 'unspoiler' actions in the subreddit's mod log
+                        for log in submission.subreddit.mod.log(action='unspoiler', limit=5):
+                            # If the log entry's target matches our submission, a mod did it
+                            if log.target_fullname == submission.fullname:
+                                mod_unspoilered = True
+                                print(f"[r/{sub_name}] Mod: {log.mod}, Subreddit: {log.subreddit} - Unspoilered post {submission.id}.")
+                                break
+                    except Exception as log_e:
+                        print(f"[r/{sub_name}] Error checking mod logs for post {submission.id}: {log_e}")
 
-                    if not submission.spoiler:
-                        if not is_moderator:
-                            try:
-                                print(f'[r/{sub_name}] Post {submission.id} unmarked as spoiler by non-mod. Re-marking.')
-                                submission.mod.spoiler()
-                            except prawcore.exceptions.ServerError as se:
-                                handle_exception(se)
-                        else:
-                            print(f'[r/{sub_name}] Post {submission.id} unmarked as spoiler by a moderator. Leaving as-is.')
-                    previous_spoiler_status[submission.id] = submission.spoiler
+                    # If no matching mod log entry is found, revert it
+                    if not mod_unspoilered:
+                        try:
+                            print(f'[r/{sub_name}] Post {submission.id} unspoilered without mod log entry. Re-marking as spoiler.')
+                            submission.mod.spoiler()
+                        except prawcore.exceptions.ServerError as se:
+                            handle_exception(se)
+                    else:
+                        print(f'[r/{sub_name}] Post {submission.id} unspoilered by a moderator. Leaving as-is.')
+
+                # Update the tracked status for the next cycle
+                previous_spoiler_status[submission.id] = submission.spoiler
+                
         except Exception as e:
             handle_exception(e)
-            time.sleep(30)
+            time.sleep(10)
 
 def handle_user_reports_and_removal():
     reddit = initialize_reddit()
