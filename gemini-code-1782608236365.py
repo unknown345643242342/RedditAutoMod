@@ -18,8 +18,6 @@ import torchvision.models as models
 import torchvision.transforms as T
 import hashlib
 import difflib as _difflib
-import configparser
-import io
 
 # =========================
 # Crash-proof runner
@@ -80,15 +78,39 @@ bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 # =========================
 def get_action_threshold(subreddit_name, rule_reason, action_type):
     """Safely fetch the numerical threshold for a specific rule and action."""
-    # Strip brackets as they break configparser sections
-    safe_reason = str(rule_reason).replace('[', '(').replace(']', ')')
+    safe_reason = str(rule_reason).replace('|', '-') # Protect against table breaks
     with subreddit_configs_lock:
         subs = subreddit_configs.get(subreddit_name, {})
     return subs.get(safe_reason, {}).get(action_type, 0)
 
+def parse_markdown_table(content):
+    """Extracts thresholds from a Markdown formatted table."""
+    config = {}
+    if not content:
+        return config
+        
+    for line in content.strip().split('\n'):
+        line = line.strip()
+        # Look for valid table rows, ignore headers and formatting lines
+        if line.startswith('|') and line.endswith('|') and 'Rule / Report Reason' not in line and ':---' not in line:
+            parts = [p.strip() for p in line.split('|')[1:-1]]
+            if len(parts) >= 5:
+                rule_name = parts[0]
+                try:
+                    config[rule_name] = {
+                        'post_remove': int(parts[1]),
+                        'post_approve': int(parts[2]),
+                        'comment_remove': int(parts[3]),
+                        'comment_approve': int(parts[4])
+                    }
+                except ValueError:
+                    # If someone typed a non-integer, default to 0 to prevent crashes
+                    config[rule_name] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
+    return config
+
 def sync_subreddit_rules_and_config(subreddit):
     """
-    Pulls subreddit rules, manages the bot_report_thresholds wiki page,
+    Pulls subreddit rules, manages the bot_report_thresholds wiki page using Markdown tables,
     syncs changes, and caches the thresholds into memory.
     """
     wiki_page_name = "bot_report_thresholds"
@@ -102,11 +124,8 @@ def sync_subreddit_rules_and_config(subreddit):
         print(f"[r/{subreddit.display_name}] Error accessing wiki: {e}")
         return
 
-    config = configparser.ConfigParser()
-    try:
-        config.read_string(content)
-    except configparser.Error:
-        config = configparser.ConfigParser() # Reset if malformed
+    # Parse existing configuration from the Markdown table
+    existing_config = parse_markdown_table(content)
 
     # Pre-populate with standard Reddit report reasons
     current_rules = [
@@ -120,53 +139,50 @@ def sync_subreddit_rules_and_config(subreddit):
     try:
         for r in subreddit.rules()['rules']:
             if r.get('short_name'):
-                current_rules.append(r['short_name'].replace('[', '(').replace(']', ')'))
+                current_rules.append(r['short_name'].replace('|', '-'))
             if r.get('violation_reason'):
-                current_rules.append(r['violation_reason'].replace('[', '(').replace(']', ')'))
+                current_rules.append(r['violation_reason'].replace('|', '-'))
     except Exception as e:
         print(f"[r/{subreddit.display_name}] Could not fetch rules: {e}")
 
-    # Remove duplicates
+    # Remove duplicates while preserving order
     current_rules = list(dict.fromkeys(current_rules))
-
-    new_config = configparser.ConfigParser()
+    
+    new_config = {}
     changed = False
 
+    # Check for new rules or copy existing data
     for rule in current_rules:
-        sec_name = str(rule)
-        new_config.add_section(sec_name)
-        
-        # If the rule already exists in the wiki, copy its existing thresholds over
-        if config.has_section(sec_name):
-            new_config[sec_name]['post_remove'] = config.get(sec_name, 'post_remove', fallback='0')
-            new_config[sec_name]['post_approve'] = config.get(sec_name, 'post_approve', fallback='0')
-            new_config[sec_name]['comment_remove'] = config.get(sec_name, 'comment_remove', fallback='0')
-            new_config[sec_name]['comment_approve'] = config.get(sec_name, 'comment_approve', fallback='0')
+        if rule in existing_config:
+            new_config[rule] = existing_config[rule]
         else:
-            # New rule detected, initialize defaults
-            new_config[sec_name]['post_remove'] = '0'
-            new_config[sec_name]['post_approve'] = '0'
-            new_config[sec_name]['comment_remove'] = '0'
-            new_config[sec_name]['comment_approve'] = '0'
+            new_config[rule] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
             changed = True
 
     # Detect if any old rules were deleted from the subreddit
-    for old_sec in config.sections():
-        if old_sec not in new_config.sections():
-            changed = True
+    if len(existing_config) != len(new_config):
+        changed = True
 
-    # If the rules changed or the page is missing, push an update to Reddit
+    # If the rules changed or the page is missing, push an updated table to Reddit
     if changed or content == "":
-        output = io.StringIO()
-        output.write("### Bot Report Thresholds Configuration\n")
-        output.write("### Set the integer value to the number of reports needed to trigger the action.\n")
-        output.write("### Set to 0 to disable an action for a specific rule.\n\n")
-        new_config.write(output)
-        new_content = output.getvalue()
+        new_content = [
+            "### Automated Bot Action Thresholds",
+            "Set the integer value to the **number of reports needed** to trigger the action.",
+            "Set to `0` to completely disable an action for a specific rule.",
+            "",
+            "| Rule / Report Reason | Post Remove | Post Approve | Comment Remove | Comment Approve |",
+            "| :--- | :---: | :---: | :---: | :---: |"
+        ]
+        
+        for rule in current_rules:
+            cfg = new_config[rule]
+            new_content.append(f"| {rule} | {cfg['post_remove']} | {cfg['post_approve']} | {cfg['comment_remove']} | {cfg['comment_approve']} |")
+            
+        final_wiki_text = "\n".join(new_content)
         
         try:
             page = subreddit.wiki[wiki_page_name]
-            page.edit(new_content, reason="Syncing updated subreddit rules to bot thresholds")
+            page.edit(final_wiki_text, reason="Syncing updated subreddit rules to bot thresholds")
             if content == "":
                 # First time setup, ensure it's hidden to moderators only
                 page.mod.update(listed=False, permlevel=2)
@@ -175,20 +191,8 @@ def sync_subreddit_rules_and_config(subreddit):
             print(f"[r/{subreddit.display_name}] Error updating wiki config page: {e}")
 
     # Load the verified rules into memory for the bot to use
-    thresholds = {}
-    for sec in new_config.sections():
-        try:
-            thresholds[sec] = {
-                'post_remove': int(new_config.get(sec, 'post_remove', fallback='0')),
-                'post_approve': int(new_config.get(sec, 'post_approve', fallback='0')),
-                'comment_remove': int(new_config.get(sec, 'comment_remove', fallback='0')),
-                'comment_approve': int(new_config.get(sec, 'comment_approve', fallback='0'))
-            }
-        except ValueError:
-            thresholds[sec] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
-    
     with subreddit_configs_lock:
-        subreddit_configs[subreddit.display_name] = thresholds
+        subreddit_configs[subreddit.display_name] = new_config
 
 # =========================
 # Standalone Sync Function
