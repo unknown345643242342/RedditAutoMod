@@ -1,0 +1,929 @@
+import praw
+import prawcore.exceptions
+import requests
+import time
+from datetime import datetime, timezone
+import numpy as np
+from PIL import Image
+import imagehash
+import cv2
+import threading
+import traceback
+import pytesseract
+import openai
+from openai import OpenAI
+from torchvision import transforms
+import torch
+import torchvision.models as models
+import torchvision.transforms as T
+import hashlib
+import difflib as _difflib
+import configparser
+import io
+
+# =========================
+# Crash-proof runner
+# =========================
+def safe_run(target, *args, **kwargs):
+    """
+    Keeps a target function running forever.
+    If the function raises, log the error, sleep briefly, and run it again.
+    """
+    while True:
+        try:
+            target(*args, **kwargs)
+        except Exception as e:
+            print(f"[FATAL] {target.__name__} crashed: {e}")
+            traceback.print_exc()
+            time.sleep(10)  # brief cooldown before retrying
+
+# =========================
+# Reddit init + error handler
+# =========================
+def initialize_reddit():
+    return praw.Reddit(
+        client_id='jl-I3OHYH2_VZMC1feoJMQ',
+        client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
+        username='PokeLeakBot3',
+        password='testbot1',
+        user_agent='testbot'
+    )
+
+def handle_exception(e):
+    if isinstance(e, prawcore.exceptions.ResponseException) and getattr(e, "response", None) and e.response.status_code == 429:
+        print("Rate limited by Reddit API. Ignoring error.")
+
+# =========================
+# Shared Bot Globals & Rule Configs
+# =========================
+subreddit_data = {}
+subreddit_data_lock = threading.Lock()
+
+# New global for holding dynamic wiki configurations
+subreddit_configs = {}
+subreddit_configs_lock = threading.Lock()
+
+device = "cpu"
+efficientnet_model = models.efficientnet_b0(pretrained=True)
+efficientnet_model.eval()
+efficientnet_model.to(device)
+efficientnet_transform = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+orb_detector = cv2.ORB_create()
+bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+# =========================
+# Dynamic Wiki Configuration Logic
+# =========================
+def get_action_threshold(subreddit_name, rule_reason, action_type):
+    """Safely fetch the numerical threshold for a specific rule and action."""
+    # Strip brackets as they break configparser sections
+    safe_reason = str(rule_reason).replace('[', '(').replace(']', ')')
+    with subreddit_configs_lock:
+        subs = subreddit_configs.get(subreddit_name, {})
+    return subs.get(safe_reason, {}).get(action_type, 0)
+
+def sync_subreddit_rules_and_config(subreddit):
+    """
+    Pulls subreddit rules, manages the bot_report_thresholds wiki page,
+    syncs changes, and caches the thresholds into memory.
+    """
+    wiki_page_name = "bot_report_thresholds"
+    
+    try:
+        page = subreddit.wiki[wiki_page_name]
+        content = page.content_md
+    except prawcore.exceptions.NotFound:
+        content = ""
+    except Exception as e:
+        print(f"[r/{subreddit.display_name}] Error accessing wiki: {e}")
+        return
+
+    config = configparser.ConfigParser()
+    try:
+        config.read_string(content)
+    except configparser.Error:
+        config = configparser.ConfigParser() # Reset if malformed
+
+    # Pre-populate with standard Reddit report reasons
+    current_rules = [
+        'This is misinformation', 
+        'This is spam', 
+        'It threatens violence or physical harm', 
+        'It is personal and confidential information'
+    ]
+    
+    # Fetch specific Subreddit Rules
+    try:
+        for r in subreddit.rules()['rules']:
+            if r.get('short_name'):
+                current_rules.append(r['short_name'].replace('[', '(').replace(']', ')'))
+            if r.get('violation_reason'):
+                current_rules.append(r['violation_reason'].replace('[', '(').replace(']', ')'))
+    except Exception as e:
+        print(f"[r/{subreddit.display_name}] Could not fetch rules: {e}")
+
+    # Remove duplicates
+    current_rules = list(dict.fromkeys(current_rules))
+
+    new_config = configparser.ConfigParser()
+    changed = False
+
+    for rule in current_rules:
+        sec_name = str(rule)
+        new_config.add_section(sec_name)
+        
+        # If the rule already exists in the wiki, copy its existing thresholds over
+        if config.has_section(sec_name):
+            new_config[sec_name]['post_remove'] = config.get(sec_name, 'post_remove', fallback='0')
+            new_config[sec_name]['post_approve'] = config.get(sec_name, 'post_approve', fallback='0')
+            new_config[sec_name]['comment_remove'] = config.get(sec_name, 'comment_remove', fallback='0')
+            new_config[sec_name]['comment_approve'] = config.get(sec_name, 'comment_approve', fallback='0')
+        else:
+            # New rule detected, initialize defaults
+            new_config[sec_name]['post_remove'] = '0'
+            new_config[sec_name]['post_approve'] = '0'
+            new_config[sec_name]['comment_remove'] = '0'
+            new_config[sec_name]['comment_approve'] = '0'
+            changed = True
+
+    # Detect if any old rules were deleted from the subreddit
+    for old_sec in config.sections():
+        if old_sec not in new_config.sections():
+            changed = True
+
+    # If the rules changed or the page is missing, push an update to Reddit
+    if changed or content == "":
+        output = io.StringIO()
+        output.write("### Bot Report Thresholds Configuration\n")
+        output.write("### Set the integer value to the number of reports needed to trigger the action.\n")
+        output.write("### Set to 0 to disable an action for a specific rule.\n\n")
+        new_config.write(output)
+        new_content = output.getvalue()
+        
+        try:
+            page = subreddit.wiki[wiki_page_name]
+            page.edit(new_content, reason="Syncing updated subreddit rules to bot thresholds")
+            if content == "":
+                # First time setup, ensure it's hidden to moderators only
+                page.mod.update(listed=False, permlevel=2)
+            print(f"[r/{subreddit.display_name}] Updated {wiki_page_name} wiki page.")
+        except Exception as e:
+            print(f"[r/{subreddit.display_name}] Error updating wiki config page: {e}")
+
+    # Load the verified rules into memory for the bot to use
+    thresholds = {}
+    for sec in new_config.sections():
+        try:
+            thresholds[sec] = {
+                'post_remove': int(new_config.get(sec, 'post_remove', fallback='0')),
+                'post_approve': int(new_config.get(sec, 'post_approve', fallback='0')),
+                'comment_remove': int(new_config.get(sec, 'comment_remove', fallback='0')),
+                'comment_approve': int(new_config.get(sec, 'comment_approve', fallback='0'))
+            }
+        except ValueError:
+            thresholds[sec] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
+    
+    with subreddit_configs_lock:
+        subreddit_configs[subreddit.display_name] = thresholds
+
+# =========================
+# Standalone Sync Function
+# =========================
+def sync_moderated_subreddits():
+    """
+    Background thread that runs every 5 minutes to:
+      1. Accept any pending moderator invites from the inbox.
+      2. Sync rules & wikis into the memory configs.
+      3. Sync all currently moderated subreddits into the duplicate registry.
+    """
+    reddit = initialize_reddit()
+    while True:
+        try:
+            # --- Step 1: Accept pending mod invites ---
+            for message in reddit.inbox.unread(limit=None):
+                if "invitation to moderate" in message.subject.lower():
+                    if hasattr(message, 'subreddit') and message.subreddit:
+                        try:
+                            message.subreddit.mod.accept_invite()
+                            print(f"[REGISTRY] Accepted invite to r/{message.subreddit.display_name}")
+                            message.mark_read()
+                        except Exception as e:
+                            print(f"[REGISTRY] Failed to accept invite for r/{message.subreddit.display_name}: {e}")
+
+            # --- Step 2 & 3: Sync Configurations and Registry ---
+            for sub in reddit.user.moderator_subreddits(limit=None):
+                # Update dynamic rules from wiki
+                sync_subreddit_rules_and_config(sub)
+                
+                # Check duplicate registry
+                with subreddit_data_lock:
+                    already_registered = sub.display_name in subreddit_data
+                if not already_registered:
+                    print(f"[REGISTRY] Registering new subreddit: r/{sub.display_name}")
+                    threading.Thread(
+                        target=setup_subreddit,
+                        args=(sub.display_name,),
+                        daemon=True
+                    ).start()
+
+        except Exception as e:
+            print(f"[REGISTRY] Sync thread error: {e}")
+
+        time.sleep(300)  # Check every 5 minutes
+
+
+# =========================
+# Shared Duplicate Bot logic
+# =========================
+def setup_subreddit(subreddit_name):
+    """Initialize data structures for a specific subreddit (no new threads)"""
+    print(f"\n=== Setting up bot for r/{subreddit_name} ===")
+    
+    reddit = initialize_reddit()
+    subreddit = reddit.subreddit(subreddit_name)
+    
+    # Create dedicated dictionaries for this subreddit
+    data = {
+        'subreddit': subreddit,
+        'image_hashes': {},
+        'orb_descriptors': {},
+        'moderator_removed_hashes': set(),
+        'processed_modqueue_submissions': set(),
+        'approved_by_moderator': set(),
+        'ai_features': {},
+        'current_time': int(time.time()),
+        'processed_log_items': set(),
+        'last_checked': {}
+    }
+    
+    with subreddit_data_lock:
+        subreddit_data[subreddit_name] = data
+    
+    # --- Helper functions for this subreddit ---
+    def get_ai_features(img):
+        try:
+            img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            img_tensor = efficientnet_transform(img_pil).unsqueeze(0).to(device)
+            with torch.no_grad():
+                feat = efficientnet_model(img_tensor)
+                feat = feat / feat.norm(dim=1, keepdim=True)
+            return feat
+        except Exception as e:
+            print(f"[r/{subreddit_name}] AI feature extraction error:", e)
+            return None
+
+    def is_problematic_image(img, white_threshold=0.7, text_threshold=0.05):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        white_ratio = np.mean(gray > 240)
+        
+        if white_ratio > white_threshold:
+            return True
+        
+        edges = cv2.Canny(gray, 100, 200)
+        edge_ratio = np.mean(edges > 0)
+        return edge_ratio > text_threshold
+
+    def preprocess_image_for_orb(img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, gray = cv2.threshold(gray, 240, 255, cv2.THRESH_TOZERO_INV)
+        edges = cv2.Canny(gray, 100, 200)
+        return edges
+
+    def get_orb_descriptors_conditional(img):
+        if is_problematic_image(img):
+            processed_img = preprocess_image_for_orb(img)
+        else:
+            processed_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        kp, des = orb_detector.detectAndCompute(processed_img, None)
+        return des
+
+    def orb_similarity(desc1, desc2):
+        if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
+            return 0
+        matches = bf_matcher.match(desc1, desc2)
+        return len(matches) / min(len(desc1), len(desc2))
+
+    def format_age(utc_timestamp):
+        now = datetime.now(timezone.utc)
+        created = datetime.fromtimestamp(utc_timestamp, tz=timezone.utc)
+        delta = now - created
+        days = delta.days
+        seconds = delta.seconds
+        if days > 0:
+            return f"{days} day{'s' if days != 1 else ''} ago"
+        elif seconds >= 3600:
+            hours = seconds // 3600
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        elif seconds >= 60:
+            minutes = seconds // 60
+            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+        else:
+            return f"{seconds} second{'s' if seconds != 1 else ''} ago"
+
+    def post_comment(submission, original_post_author, original_post_title, original_post_date, original_post_utc, original_status, original_post_permalink):
+        max_retries = 3
+        retries = 0
+        age_text = format_age(original_post_utc)
+        while retries < max_retries:
+            try:
+                comment_text = (
+                    "> **Duplicate detected**\n\n"
+                    "| Original Author | Title | Date | Age | Status |\n"
+                    "|:---------------:|:-----:|:----:|:---:|:------:|\n"
+                    f"| {original_post_author} | [{original_post_title}]({original_post_permalink}) | {original_post_date} | {age_text} | {original_status} |"
+                )
+                comment = submission.reply(comment_text)
+                comment.mod.distinguish(sticky=True)
+                print(f"[r/{subreddit_name}] Duplicate removed and comment posted: ", submission.url)
+                return True
+            except Exception as e:
+                handle_exception(e)
+                retries += 1
+                time.sleep(1)
+        return False
+
+    def load_and_process_image(url):
+        image_data = requests.get(url, timeout=10).content
+        img = np.asarray(bytearray(image_data), dtype=np.uint8)
+        img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hash_value = str(imagehash.phash(Image.fromarray(gray)))
+        print(f"[r/{subreddit_name}] Generated hash: {hash_value}")
+        
+        descriptors = get_orb_descriptors_conditional(img)
+        features = get_ai_features(img)
+            
+        return img, hash_value, descriptors, features
+
+    def get_cached_ai_features(submission_id):
+        if submission_id in data['ai_features']:
+            return data['ai_features'][submission_id]
+        
+        old_submission = reddit.submission(id=submission_id)
+        old_image_data = requests.get(old_submission.url, timeout=10).content
+        old_img = cv2.imdecode(np.asarray(bytearray(old_image_data), dtype=np.uint8), cv2.IMREAD_COLOR)
+        old_features = get_ai_features(old_img)
+        data['ai_features'][submission_id] = old_features
+        return old_features
+
+    def calculate_ai_similarity(features1, features2):
+        if features1 is not None and features2 is not None:
+            return (features1 @ features2.T).item()
+        return 0
+
+    def check_hash_duplicate(submission, hash_value, new_features):
+        matched_hash = None
+        for stored_hash in data['image_hashes'].keys():
+            if hash_value == stored_hash or (imagehash.hex_to_hash(hash_value) - imagehash.hex_to_hash(stored_hash)) <= 3:
+                matched_hash = stored_hash
+                break
+        
+        if matched_hash is None:
+            return False, None, None, None, None, None, None
+        
+        original_id, original_time = data['image_hashes'][matched_hash]
+        
+        if submission.id == original_id or submission.created_utc <= original_time:
+            return False, None, None, None, None, None, None
+        
+        original_submission = reddit.submission(id=original_id)
+        original_features = get_cached_ai_features(original_submission.id)
+        
+        ai_score = calculate_ai_similarity(new_features, original_features)
+        
+        print(f"[r/{subreddit_name}] Hash match detected. AI similarity: {ai_score:.2f}")
+        
+        if ai_score > 0.50:
+            original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+            original_status = "Removed by Moderator" if matched_hash in data['moderator_removed_hashes'] else "Active"
+            return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
+        
+        return False, None, None, None, None, None, None
+
+    def check_orb_duplicate(submission, descriptors, new_features):
+        for old_id, old_desc in data['orb_descriptors'].items():
+            sim = orb_similarity(descriptors, old_desc)
+            
+            if sim > 0.50:
+                old_features = get_cached_ai_features(old_id)
+                
+                ai_score = calculate_ai_similarity(new_features, old_features)
+                
+                if ai_score > 0.75:
+                    print(f"[r/{subreddit_name}] ORB duplicate found! AI similarity: {ai_score:.2f}")
+                    
+                    original_submission = reddit.submission(id=old_id)
+                    original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+                    old_hash = next((h for h, v in data['image_hashes'].items() if v[0] == old_id), None)
+                    original_status = "Removed by Moderator" if old_hash and old_hash in data['moderator_removed_hashes'] else "Active"
+                    
+                    return True, original_submission.author.name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
+        
+        return False, None, None, None, None, None, None
+
+    def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink):
+        if not submission.approved:
+            submission.mod.remove()
+            post_comment(submission, author, title, date, utc, status, permalink)
+            print(f"[r/{subreddit_name}] Duplicate removed by {detection_method}: {submission.url}")
+        return True
+
+    def handle_moderator_removed_repost(submission, hash_value):
+        if hash_value in data['moderator_removed_hashes'] and not submission.approved:
+            submission.mod.remove()
+            original_submission = reddit.submission(id=data['image_hashes'][hash_value][0])
+            post_comment(
+                submission,
+                original_submission.author.name,
+                original_submission.title,
+                datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
+                original_submission.created_utc,
+                "Removed by Moderator",
+                original_submission.permalink
+            )
+            print(f"[r/{subreddit_name}] Repost of a moderator-removed image removed: ", submission.url)
+            return True
+        return False
+
+    def process_submission_for_duplicates(submission, context="stream"):
+        try:
+            img, hash_value, descriptors, new_features = load_and_process_image(submission.url)
+            data['ai_features'][submission.id] = new_features
+            
+            if handle_moderator_removed_repost(submission, hash_value):
+                return True
+            
+            is_duplicate, author, title, date, utc, status, permalink = check_hash_duplicate(
+                submission, hash_value, new_features
+            )
+            if is_duplicate:
+                return handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink)
+            
+            is_duplicate, author, title, date, utc, status, permalink = check_orb_duplicate(
+                submission, descriptors, new_features
+            )
+            if is_duplicate:
+                return handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink)
+            
+            if hash_value not in data['image_hashes']:
+                data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
+                data['orb_descriptors'][submission.id] = descriptors
+                data['ai_features'][submission.id] = new_features
+                print(f"[r/{subreddit_name}] Stored new original: {submission.url}")
+            
+            if context == "modqueue" and not submission.approved:
+                submission.mod.approve()
+                print(f"[r/{subreddit_name}] Original submission approved: ", submission.url)
+            
+            return False
+            
+        except Exception as e:
+            handle_exception(e)
+            return False
+
+    # Store the process_submission function for this subreddit
+    data['process_submission'] = process_submission_for_duplicates
+    
+    # --- Initial scan ---
+    print(f"[r/{subreddit_name}] Starting initial scan...")
+    try:
+        for submission in subreddit.new(limit=20):
+            if isinstance(submission, praw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                print(f"[r/{subreddit_name}] Indexing submission (initial scan): ", submission.url)
+                try:
+                    img, hash_value, descriptors, features = load_and_process_image(submission.url)
+                    if hash_value not in data['image_hashes']:
+                        data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
+                        data['orb_descriptors'][submission.id] = descriptors
+                        data['ai_features'][submission.id] = features
+                except Exception as e:
+                    handle_exception(e)
+    except Exception as e:
+        handle_exception(e)
+    
+    print(f"[r/{subreddit_name}] Initial scan complete. Indexed {len(data['image_hashes'])} images.")
+    print(f"[r/{subreddit_name}] Bot setup complete!\n")
+
+
+# =========================
+# Dynamic Workers
+# =========================
+def monitor_reported_posts():
+    reddit = initialize_reddit()
+    while True:
+        try:
+            for post in reddit.subreddit('mod').mod.reports():
+                if getattr(post, "approved", False):
+                    post.mod.approve()
+                    print(f"[r/{post.subreddit.display_name}] Post {post.id} has been approved again")
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(60)
+
+def handle_modqueue_items():
+    reddit = initialize_reddit()
+    timers = {}
+
+    while True:
+        try:
+            for item in reddit.subreddit('mod').mod.modqueue():
+                sub_name = item.subreddit.display_name
+                if getattr(item, "num_reports", 0) == 1 and item.id not in timers:
+                    created_time = getattr(item, "created_utc", time.time())
+                    timers[item.id] = time.time()
+                    print(f"[r/{sub_name}] Starting timer for post {item.id} (created {created_time})...")
+
+                if item.id in timers:
+                    start_time = timers[item.id]
+                    time_diff = time.time() - start_time
+                    if time_diff >= 3600:
+                        try:
+                            item.mod.approve()
+                            print(f"[r/{sub_name}] Approved post {item.id} with one report")
+                            del timers[item.id]
+                        except prawcore.exceptions.ServerError as se:
+                            handle_exception(se)
+                    else:
+                        new_reports = getattr(item, "report_reasons", None)
+                        if new_reports != getattr(item, "report_reasons", None):
+                            print(f"[r/{sub_name}] New reports for post {item.id}, leaving post in mod queue")
+                            del timers[item.id]
+                        else:
+                            time_remaining = int(start_time + 3600 - time.time())
+                            print(f"[r/{sub_name}] Time remaining for post {item.id}: {time_remaining} seconds")
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(60)
+
+def handle_spoiler_status():
+    reddit = initialize_reddit()
+    previous_spoiler_status = {}
+
+    while True:
+        try:
+            # We fetch recent submissions from the aggregated mod feed
+            for submission in reddit.subreddit('mod').new(limit=100):
+                sub_name = submission.subreddit.display_name
+                
+                # First time seeing this submission, record its status
+                if submission.id not in previous_spoiler_status:
+                    previous_spoiler_status[submission.id] = submission.spoiler
+                    continue
+
+                # Detect if the status changed from True to False (unspoilered)
+                if previous_spoiler_status[submission.id] and not submission.spoiler:
+                    mod_unspoilered = False
+                    
+                    try:
+                        # Check the last 5 'unspoiler' actions in the subreddit's mod log
+                        for log in submission.subreddit.mod.log(action='unspoiler', limit=5):
+                            # If the log entry's target matches our submission, a mod did it
+                            if log.target_fullname == submission.fullname:
+                                mod_unspoilered = True
+                                print(f"[r/{sub_name}] Mod: {log.mod}, Subreddit: {log.subreddit} - Unspoilered post {submission.id}.")
+                                break
+                    except Exception as log_e:
+                        print(f"[r/{sub_name}] Error checking mod logs for post {submission.id}: {log_e}")
+
+                    # If no matching mod log entry is found, revert it
+                    if not mod_unspoilered:
+                        try:
+                            print(f'[r/{sub_name}] Post {submission.id} unspoilered without mod log entry. Re-marking as spoiler.')
+                            submission.mod.spoiler()
+                        except prawcore.exceptions.ServerError as se:
+                            handle_exception(se)
+                    else:
+                        print(f'[r/{sub_name}] Post {submission.id} unspoilered by a moderator. Leaving as-is.')
+
+                # Update the tracked status for the next cycle
+                previous_spoiler_status[submission.id] = submission.spoiler
+                
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(10)
+
+def handle_user_reports_and_removal():
+    reddit = initialize_reddit()
+    while True:
+        try:
+            for comment in reddit.subreddit('mod').mod.modqueue(limit=100):
+                if isinstance(comment, praw.models.Comment) and getattr(comment, "user_reports", None):
+                    sub_name = comment.subreddit.display_name
+                    for report in comment.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'comment_remove')
+                        
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                comment.mod.remove()
+                                print(f'[r/{sub_name}] Comment removed due to {count} reports for reason: {reason}')
+                                break # Stop checking other reports once action is taken
+                            except prawcore.exceptions.ServerError as se:
+                                handle_exception(se)
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(60)
+
+def handle_submissions_based_on_user_reports():
+    reddit = initialize_reddit()
+    while True:
+        try:
+            for post in reddit.subreddit('mod').mod.modqueue(limit=100):
+                if isinstance(post, praw.models.Submission) and getattr(post, "user_reports", None):
+                    sub_name = post.subreddit.display_name
+                    for report in post.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'post_approve')
+                        
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                post.mod.approve()
+                                print(f'[r/{sub_name}] Post "{post.title}" approved due to {count} reports for reason: {reason}')
+                                break
+                            except prawcore.exceptions.ServerError as se:
+                                handle_exception(se)
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(60)
+
+def handle_posts_based_on_removal():
+    reddit = initialize_reddit()
+    while True:
+        try:
+            for post in reddit.subreddit('mod').mod.modqueue(limit=100):
+                if isinstance(post, praw.models.Submission) and getattr(post, "user_reports", None):
+                    sub_name = post.subreddit.display_name
+                    for report in post.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'post_remove')
+                        
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                post.mod.remove()
+                                print(f'[r/{sub_name}] Submission "{post.title}" removed due to {count} reports for reason: {reason}')
+                                break
+                            except prawcore.exceptions.ServerError as se:
+                                handle_exception(se)
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(60)
+
+def handle_comments_based_on_approval():
+    reddit = initialize_reddit()
+    while True:
+        try:
+            for comment in reddit.subreddit('mod').mod.modqueue(limit=100):
+                if getattr(comment, "user_reports", None):
+                    sub_name = comment.subreddit.display_name
+                    for report in comment.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'comment_approve')
+                        
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                comment.mod.approve()
+                                print(f'[r/{sub_name}] Comment "{comment.body}" approved due to {count} reports for reason: {reason}')
+                                break
+                            except prawcore.exceptions.ServerError as se:
+                                handle_exception(se)
+        except Exception as e:
+            handle_exception(e)
+            time.sleep(60)
+
+def run_pokemon_duplicate_bot():
+    reddit = initialize_reddit()
+    
+    # --- SHARED WORKER THREADS (one of each for ALL subreddits) ---
+    def shared_mod_log_monitor():
+        while True:
+            try:
+                with subreddit_data_lock:
+                    subreddits = list(subreddit_data.keys())
+                
+                for subreddit_name in subreddits:
+                    try:
+                        data = subreddit_data[subreddit_name]
+                        subreddit = data['subreddit']
+                        
+                        for log_entry in subreddit.mod.log(action='removelink', limit=50):
+                            if log_entry.id in data['processed_log_items']:
+                                continue
+                            
+                            data['processed_log_items'].add(log_entry.id)
+                            removed_submission_id = log_entry.target_fullname.replace('t3_', '')
+                            
+                            hash_to_process = None
+                            for hash_value, (submission_id, creation_time) in list(data['image_hashes'].items()):
+                                if submission_id == removed_submission_id:
+                                    hash_to_process = hash_value
+                                    break
+                            
+                            if hash_to_process and hash_to_process not in data['moderator_removed_hashes']:
+                                data['moderator_removed_hashes'].add(hash_to_process)
+                                print(f"[r/{subreddit_name}] [MOD REMOVE] Submission {removed_submission_id} removed by moderator. Hash kept for future duplicate detection.")
+                            
+                            if len(data['processed_log_items']) > 1000:
+                                data['processed_log_items'].clear()
+                    
+                    except Exception as e:
+                        print(f"[r/{subreddit_name}] Error in mod log check: {e}")
+                
+            except Exception as e:
+                print(f"Error in shared mod log monitor: {e}")
+            
+            time.sleep(30)
+    
+    def shared_removal_checker():
+        while True:
+            try:
+                with subreddit_data_lock:
+                    subreddits = list(subreddit_data.keys())
+                
+                for subreddit_name in subreddits:
+                    try:
+                        data = subreddit_data[subreddit_name]
+                        current_check_time = time.time()
+                        checked_this_cycle = 0
+                        
+                        recent_submissions = []
+                        medium_submissions = []
+                        old_submissions = []
+                        
+                        for hash_value, (submission_id, creation_time) in list(data['image_hashes'].items()):
+                            if hash_value in data['moderator_removed_hashes']:
+                                continue
+                            
+                            age = current_check_time - creation_time
+                            last_check = data['last_checked'].get(submission_id, 0)
+                            
+                            if age < 3600:
+                                check_interval = 30
+                                if current_check_time - last_check >= check_interval:
+                                    recent_submissions.append((hash_value, submission_id))
+                            elif age < 86400:
+                                check_interval = 300
+                                if current_check_time - last_check >= check_interval:
+                                    medium_submissions.append((hash_value, submission_id))
+                            else:
+                                check_interval = 1800
+                                if current_check_time - last_check >= check_interval:
+                                    old_submissions.append((hash_value, submission_id))
+                        
+                        all_to_check = recent_submissions + medium_submissions[:20] + old_submissions[:10]
+                        
+                        for hash_value, submission_id in all_to_check:
+                            try:
+                                original_submission = reddit.submission(id=submission_id)
+                                original_author = original_submission.author
+                                
+                                if original_author is None:
+                                    if hash_value in data['image_hashes']:
+                                        del data['image_hashes'][hash_value]
+                                    if submission_id in data['orb_descriptors']:
+                                        del data['orb_descriptors'][submission_id]
+                                    if submission_id in data['ai_features']:
+                                        del data['ai_features'][submission_id]
+                                    if submission_id in data['last_checked']:
+                                        del data['last_checked'][submission_id]
+                                    print(f"[r/{subreddit_name}] [USER DELETE] Submission {submission_id} deleted by user. Hash removed.")
+                                else:
+                                    data['last_checked'][submission_id] = current_check_time
+                                
+                                checked_this_cycle += 1
+                                
+                                if checked_this_cycle >= 10:
+                                    time.sleep(60)
+                                    checked_this_cycle = 0
+                                
+                            except Exception as e:
+                                print(f"[r/{subreddit_name}] Error checking submission {submission_id}: {e}")
+                                data['last_checked'][submission_id] = current_check_time
+                    
+                    except Exception as e:
+                        print(f"[r/{subreddit_name}] Error in removal check: {e}")
+                
+            except Exception as e:
+                print(f"Error in shared removal checker: {e}")
+            
+            time.sleep(60)
+    
+    def shared_modqueue_worker():
+        while True:
+            try:
+                with subreddit_data_lock:
+                    subreddits = list(subreddit_data.keys())
+                
+                for subreddit_name in subreddits:
+                    try:
+                        data = subreddit_data[subreddit_name]
+                        subreddit = data['subreddit']
+                        
+                        modqueue_submissions = subreddit.mod.modqueue(only='submission', limit=None)
+                        modqueue_submissions = sorted(modqueue_submissions, key=lambda x: x.created_utc)
+                        
+                        for submission in modqueue_submissions:
+                            if not isinstance(submission, praw.models.Submission):
+                                continue
+                            
+                            print(f"[r/{subreddit_name}] Scanning Mod Queue: ", submission.url)
+                            
+                            if submission.num_reports > 0:
+                                print(f"[r/{subreddit_name}] Skipping reported image: ", submission.url)
+                                data['image_hashes'] = {k: v for k, v in data['image_hashes'].items() if v[0] != submission.id}
+                                data['orb_descriptors'].pop(submission.id, None)
+                                data['ai_features'].pop(submission.id, None)
+                                continue
+                            
+                            if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                                data['process_submission'](submission, context="modqueue")
+                                data['processed_modqueue_submissions'].add(submission.id)
+                    
+                    except Exception as e:
+                        print(f"[r/{subreddit_name}] Error in modqueue worker: {e}")
+            
+            except Exception as e:
+                print(f"Error in shared modqueue worker: {e}")
+            
+            time.sleep(15)
+    
+    def shared_stream_worker():
+        while True:
+            try:
+                with subreddit_data_lock:
+                    subreddits = list(subreddit_data.keys())
+                
+                for subreddit_name in subreddits:
+                    try:
+                        data = subreddit_data[subreddit_name]
+                        subreddit = data['subreddit']
+                        
+                        for submission in subreddit.new(limit=10):
+                            if submission.created_utc > data['current_time'] and isinstance(submission, praw.models.Submission):
+                                if submission.id in data['processed_modqueue_submissions']:
+                                    continue
+
+                                print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
+                                
+                                if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                                    data['process_submission'](submission, context="stream")
+                        
+                        data['current_time'] = int(time.time())
+                    
+                    except Exception as e:
+                        print(f"[r/{subreddit_name}] Error in stream worker: {e}")
+            
+            except Exception as e:
+                print(f"Error in shared stream worker: {e}")
+            
+            time.sleep(20)
+
+    # Start 4 shared worker threads (total, regardless of number of subreddits)
+    threading.Thread(target=shared_mod_log_monitor, daemon=True).start()
+    threading.Thread(target=shared_removal_checker, daemon=True).start()
+    threading.Thread(target=shared_modqueue_worker, daemon=True).start()
+    threading.Thread(target=shared_stream_worker, daemon=True).start()
+
+    # Keep main thread alive
+    print("=== Multi-subreddit duplicate bot started ===")
+    print("Running with 4 shared worker threads for all subreddits")
+    while True:
+        time.sleep(20)  # Keep alive
+        
+# =========================
+# Main: start threads via safe_run
+# =========================
+if __name__ == "__main__":
+    threads = {}
+
+    def add_thread(name, func, *args, **kwargs):
+        t = threading.Thread(target=safe_run, args=(func,)+args, kwargs=kwargs, daemon=True)
+        t.start()
+        threads[name] = t
+        print(f"[STARTED] {name}")
+
+    add_thread('modqueue_thread', handle_modqueue_items)
+    add_thread('reported_posts_thread', monitor_reported_posts)
+    add_thread('spoiler_status_thread', handle_spoiler_status)
+    add_thread('user_reports_removal_thread', handle_user_reports_and_removal)
+    add_thread('submissions_based_on_user_reports_thread', handle_submissions_based_on_user_reports)
+    add_thread('posts_based_on_removal_thread', handle_posts_based_on_removal)
+    add_thread('comments_based_on_approval_thread', handle_comments_based_on_approval)
+    add_thread('run_pokemon_duplicate_bot_thread', run_pokemon_duplicate_bot)
+    add_thread('sync_moderated_subreddits_thread', sync_moderated_subreddits)
+
+    # Keep the main thread alive indefinitely so daemon threads keep running.
+    while True:
+        time.sleep(30)
