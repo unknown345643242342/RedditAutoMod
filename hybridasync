@@ -30,7 +30,7 @@ subreddit_configs = {}
 # Note: No threading locks are needed in asyncio for standard dictionary mutations!
 
 device = "cpu"
-efficientnet_model = models.efficientnet_b0(pretrained=True)
+efficientnet_model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
 efficientnet_model.eval()
 efficientnet_model.to(device)
 efficientnet_transform = T.Compose([
@@ -112,12 +112,11 @@ async def sync_subreddit_rules_and_config(subreddit):
     ]
     
     try:
-        rules_dict = await subreddit.rules()
-        for r in rules_dict['rules']:
-            if r.get('short_name'):
-                current_rules.append(r['short_name'].replace('|', '-').strip())
-            if r.get('violation_reason'):
-                current_rules.append(r['violation_reason'].replace('|', '-').strip())
+        async for r in subreddit.rules:
+            if hasattr(r, 'short_name') and r.short_name:
+                current_rules.append(r.short_name.replace('|', '-').strip())
+            if hasattr(r, 'violation_reason') and r.violation_reason:
+                current_rules.append(r.violation_reason.replace('|', '-').strip())
     except Exception as e:
         print(f"[r/{subreddit.display_name}] Could not fetch rules: {e}")
 
@@ -843,3 +842,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[SYSTEM] Bot shutdown initiated by user.")
+
