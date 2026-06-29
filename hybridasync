@@ -1,9 +1,7 @@
 import asyncio
+import aiohttp
 import asyncpraw
 import asyncprawcore.exceptions
-import aiohttp
-import concurrent.futures
-import threading
 import time
 from datetime import datetime, timezone
 import numpy as np
@@ -11,14 +9,25 @@ from PIL import Image
 import imagehash
 import cv2
 import traceback
+import pytesseract
+import openai
+from torchvision import transforms
 import torch
 import torchvision.models as models
 import torchvision.transforms as T
+import hashlib
+import difflib as _difflib
 
+# =========================
+# Shared Async Globals & Configs
+# =========================
+# Shared clients initialized in main()
+reddit = None
+http_session = None
 
-# ══════════════════════════════════════════════════════════
-#  CPU-bound globals  (read-only after startup; thread-safe)
-# ══════════════════════════════════════════════════════════
+subreddit_data = {}
+subreddit_configs = {}
+# Note: No threading locks are needed in asyncio for standard dictionary mutations!
 
 device = "cpu"
 efficientnet_model = models.efficientnet_b0(pretrained=True)
@@ -29,830 +38,808 @@ efficientnet_transform = T.Compose([
     T.ToTensor(),
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+orb_detector = cv2.ORB_create()
+bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-# OpenCV ORB/BFMatcher objects are NOT thread-safe to share across threads.
-# Use thread-local instances so each executor worker gets its own copy.
-_thread_local = threading.local()
-
-def _get_orb():
-    if not hasattr(_thread_local, 'orb'):
-        _thread_local.orb = cv2.ORB_create()
-        _thread_local.bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    return _thread_local.orb, _thread_local.bf
-
-# Single thread pool for all CPU-bound work; 4 workers balances
-# parallelism vs. memory for EfficientNet on CPU.
-cpu_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="cpu"
-)
-
-
-# ══════════════════════════════════════════════════════════
-#  Shared async state  (locks initialized inside main())
-# ══════════════════════════════════════════════════════════
-
-subreddit_data:    dict = {}
-subreddit_configs: dict = {}
-# Typed as Any here; real asyncio.Lock objects are assigned in main()
-subreddit_data_lock:    asyncio.Lock
-subreddit_configs_lock: asyncio.Lock
-
-
-# ══════════════════════════════════════════════════════════
-#  Reddit + error helpers
-# ══════════════════════════════════════════════════════════
-
-def make_reddit() -> asyncpraw.Reddit:
-    return asyncpraw.Reddit(
-        client_id     = 'jl-I3OHYH2_VZMC1feoJMQ',
-        client_secret = 'TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-        username      = 'PokeLeakBot3',
-        password      = 'testbot1',
-        user_agent    = 'testbot',
-    )
-
-def handle_exception(e: Exception) -> None:
-    if isinstance(e, asyncprawcore.exceptions.ResponseException):
-        if getattr(e, "response", None) and e.response.status_code == 429:
-            print("Rate-limited by Reddit API. Ignoring.")
-
-async def safe_run(coro_fn, *args, **kwargs) -> None:
-    """Restart a coroutine forever after any crash."""
+# =========================
+# Crash-proof runner
+# =========================
+async def safe_run(target, *args, **kwargs):
+    """
+    Keeps an async target function running forever.
+    """
     while True:
         try:
-            await coro_fn(*args, **kwargs)
+            await target(*args, **kwargs)
         except Exception as e:
-            print(f"[FATAL] {coro_fn.__name__} crashed: {e}")
+            print(f"[FATAL] {target.__name__} crashed: {e}")
             traceback.print_exc()
-            await asyncio.sleep(10)
+            await asyncio.sleep(10)  # brief cooldown before retrying
 
+def handle_exception(e):
+    if isinstance(e, asyncprawcore.exceptions.ResponseException) and getattr(e, "response", None) and e.response.status == 429:
+        print("Rate limited by Reddit API. Ignoring error.")
 
-# ══════════════════════════════════════════════════════════
-#  Pure CPU functions  (only called via run_in_executor)
-# ══════════════════════════════════════════════════════════
+# =========================
+# Dynamic Wiki Configuration Logic
+# =========================
+def get_action_threshold(subreddit_name, rule_reason, action_type):
+    safe_reason = str(rule_reason).replace('|', '-').strip()
+    subs = subreddit_configs.get(subreddit_name, {})
+    return subs.get(safe_reason, {}).get(action_type, 0)
 
-def _cpu_get_ai_features(img):
-    """Run EfficientNet inference and return a normalized feature tensor."""
-    try:
-        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        tensor  = efficientnet_transform(img_pil).unsqueeze(0).to(device)
-        with torch.no_grad():
-            feat = efficientnet_model(tensor)
-            return feat / feat.norm(dim=1, keepdim=True)
-    except Exception as e:
-        print(f"AI feature error: {e}")
-        return None
-
-def _cpu_decode_and_get_features(image_bytes: bytes):
-    """Decode raw image bytes and return AI features (for the cache path)."""
-    img = cv2.imdecode(np.asarray(bytearray(image_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
-    return _cpu_get_ai_features(img)
-
-def _cpu_is_problematic(img, white_thr=0.7, edge_thr=0.05) -> bool:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if np.mean(gray > 240) > white_thr:
-        return True
-    return np.mean(cv2.Canny(gray, 100, 200) > 0) > edge_thr
-
-def _cpu_get_orb_descriptors(img):
-    orb, _ = _get_orb()
-    if _cpu_is_problematic(img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, gray = cv2.threshold(gray, 240, 255, cv2.THRESH_TOZERO_INV)
-        processed = cv2.Canny(gray, 100, 200)
-    else:
-        processed = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, des = orb.detectAndCompute(processed, None)
-    return des
-
-def _cpu_orb_similarity(desc1, desc2) -> float:
-    if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
-        return 0.0
-    _, bf = _get_orb()
-    return len(bf.match(desc1, desc2)) / min(len(desc1), len(desc2))
-
-def _cpu_process_image(image_bytes: bytes):
-    """Full pipeline: decode → phash → ORB descriptors → EfficientNet features."""
-    img   = cv2.imdecode(np.asarray(bytearray(image_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
-    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h_val = str(imagehash.phash(Image.fromarray(gray)))
-    desc  = _cpu_get_orb_descriptors(img)
-    feat  = _cpu_get_ai_features(img)
-    return img, h_val, desc, feat
-
-def _cpu_ai_similarity(f1, f2) -> float:
-    if f1 is not None and f2 is not None:
-        return (f1 @ f2.T).item()
-    return 0.0
-
-
-# ══════════════════════════════════════════════════════════
-#  Async image loader
-# ══════════════════════════════════════════════════════════
-
-async def fetch_and_process_image(session: aiohttp.ClientSession, url: str):
-    """
-    Download image bytes asynchronously, then push all CPU work to the
-    thread pool executor so the event loop stays free.
-    """
-    loop = asyncio.get_running_loop()
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-        image_bytes = await resp.read()
-    return await loop.run_in_executor(cpu_executor, _cpu_process_image, image_bytes)
-
-
-# ══════════════════════════════════════════════════════════
-#  Wiki / config helpers
-# ══════════════════════════════════════════════════════════
-
-def _parse_markdown_table(content: str) -> dict:
+def parse_markdown_table(content):
     config = {}
     if not content:
         return config
+        
     for line in content.strip().split('\n'):
         line = line.strip()
-        if (line.startswith('|') and line.endswith('|')
-                and 'Rule / Report Reason' not in line
-                and ':---' not in line):
+        if line.startswith('|') and line.endswith('|') and 'Rule / Report Reason' not in line and ':---' not in line:
             parts = [p.strip() for p in line.split('|')[1:-1]]
             if len(parts) >= 5:
+                rule_name = parts[0]
                 try:
-                    config[parts[0]] = {
-                        'post_remove':    int(parts[1]),
-                        'post_approve':   int(parts[2]),
+                    config[rule_name] = {
+                        'post_remove': int(parts[1]),
+                        'post_approve': int(parts[2]),
                         'comment_remove': int(parts[3]),
-                        'comment_approve':int(parts[4]),
+                        'comment_approve': int(parts[4])
                     }
                 except ValueError:
-                    config[parts[0]] = dict.fromkeys(
-                        ['post_remove', 'post_approve', 'comment_remove', 'comment_approve'], 0)
+                    config[rule_name] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
     return config
 
-async def sync_subreddit_rules_and_config(subreddit) -> None:
-    wiki_name = "bot_report_thresholds"
-    content   = ""
-    page      = None
+async def sync_subreddit_rules_and_config(subreddit):
+    wiki_page_name = "bot_report_thresholds"
+    
     try:
-        page    = subreddit.wiki[wiki_name]
-        await page.load()
-        content = page.content_md or ""
+        page = await subreddit.wiki.get_page(wiki_page_name)
+        content = page.content_md
     except asyncprawcore.exceptions.NotFound:
         content = ""
     except Exception as e:
-        print(f"[r/{subreddit.display_name}] Wiki access error: {e}")
+        print(f"[r/{subreddit.display_name}] Error accessing wiki: {e}")
         return
 
-    existing = _parse_markdown_table(content)
+    existing_config = parse_markdown_table(content)
+
     current_rules = [
-        'This is misinformation', 'This is spam',
-        'It threatens violence or physical harm',
-        'It is personal and confidential information',
+        'This is misinformation', 
+        'This is spam', 
+        'It threatens violence or physical harm', 
+        'It is personal and confidential information'
     ]
+    
     try:
-        rules_data = await subreddit.rules()
-        for r in rules_data.get('rules', []):
-            for key in ('short_name', 'violation_reason'):
-                if r.get(key):
-                    current_rules.append(r[key].replace('|', '-').strip())
+        rules_dict = await subreddit.rules()
+        for r in rules_dict['rules']:
+            if r.get('short_name'):
+                current_rules.append(r['short_name'].replace('|', '-').strip())
+            if r.get('violation_reason'):
+                current_rules.append(r['violation_reason'].replace('|', '-').strip())
     except Exception as e:
-        print(f"[r/{subreddit.display_name}] Rules fetch error: {e}")
+        print(f"[r/{subreddit.display_name}] Could not fetch rules: {e}")
 
     current_rules = list(dict.fromkeys(current_rules))
-    new_config = {
-        rule: existing.get(rule, dict.fromkeys(
-            ['post_remove', 'post_approve', 'comment_remove', 'comment_approve'], 0))
-        for rule in current_rules
-    }
+    
+    existing_rules_set = set(existing_config.keys())
+    current_rules_set = set(current_rules)
+    needs_wiki_update = (content == "") or (existing_rules_set != current_rules_set)
 
-    if content == "" or set(existing) != set(current_rules):
-        lines = [
+    new_config = {}
+    for rule in current_rules:
+        if rule in existing_config:
+            new_config[rule] = existing_config[rule]
+        else:
+            new_config[rule] = {'post_remove': 0, 'post_approve': 0, 'comment_remove': 0, 'comment_approve': 0}
+
+    if needs_wiki_update:
+        new_content = [
             "### Automated Bot Action Thresholds",
             "Set the integer value to the **number of reports needed** to trigger the action.",
-            "Set to `0` to completely disable an action for a specific rule.", "",
+            "Set to `0` to completely disable an action for a specific rule.",
+            "",
             "| Rule / Report Reason | Post Remove | Post Approve | Comment Remove | Comment Approve |",
-            "| :--- | :---: | :---: | :---: | :---: |",
+            "| :--- | :---: | :---: | :---: | :---: |"
         ]
+        
         for rule in current_rules:
-            c = new_config[rule]
-            lines.append(
-                f"| {rule} | {c['post_remove']} | {c['post_approve']}"
-                f" | {c['comment_remove']} | {c['comment_approve']} |"
-            )
-        new_text = "\n".join(lines)
-        if new_text.strip() != content.strip():
+            cfg = new_config[rule]
+            new_content.append(f"| {rule} | {cfg['post_remove']} | {cfg['post_approve']} | {cfg['comment_remove']} | {cfg['comment_approve']} |")
+            
+        final_wiki_text = "\n".join(new_content)
+        
+        if final_wiki_text.strip() != content.strip():
             try:
-                await page.edit(content=new_text, reason="Syncing subreddit rules to bot thresholds")
+                page = await subreddit.wiki.get_page(wiki_page_name)
+                await page.edit(content=final_wiki_text, reason="Syncing updated subreddit rules to bot thresholds")
                 if content == "":
                     await page.mod.update(listed=False, permlevel=2)
-                print(f"[r/{subreddit.display_name}] Wiki updated.")
+                print(f"[r/{subreddit.display_name}] Updated {wiki_page_name} wiki page.")
             except Exception as e:
-                print(f"[r/{subreddit.display_name}] Wiki edit error: {e}")
+                print(f"[r/{subreddit.display_name}] Error updating wiki config page: {e}")
 
-    async with subreddit_configs_lock:
-        if subreddit_configs.get(subreddit.display_name) != new_config:
-            subreddit_configs[subreddit.display_name] = new_config
-            print(f"[r/{subreddit.display_name}] Config synced.")
+    current_memory_config = subreddit_configs.get(subreddit.display_name, {})
+    if current_memory_config != new_config:
+        subreddit_configs[subreddit.display_name] = new_config
+        print(f"[r/{subreddit.display_name}] Internal bot thresholds updated and synchronized.")
 
-def get_action_threshold(sub_name: str, reason: str, action: str) -> int:
-    """Thread-safe read from subreddit_configs (dict reads are atomic in CPython)."""
-    safe = str(reason).replace('|', '-').strip()
-    return subreddit_configs.get(sub_name, {}).get(safe, {}).get(action, 0)
+# =========================
+# Standalone Sync Function
+# =========================
+async def sync_moderated_subreddits():
+    while True:
+        try:
+            async for message in reddit.inbox.unread(limit=None):
+                if "invitation to moderate" in message.subject.lower():
+                    if hasattr(message, 'subreddit') and message.subreddit:
+                        try:
+                            await message.subreddit.mod.accept_invite()
+                            print(f"[REGISTRY] Accepted invite to r/{message.subreddit.display_name}")
+                            await message.mark_read()
+                        except Exception as e:
+                            print(f"[REGISTRY] Failed to accept invite for r/{message.subreddit.display_name}: {e}")
 
+            async for sub in reddit.user.moderator_subreddits(limit=None):
+                await sync_subreddit_rules_and_config(sub)
+                
+                if sub.display_name not in subreddit_data:
+                    print(f"[REGISTRY] Registering new subreddit: r/{sub.display_name}")
+                    # Launch setup asynchronously
+                    asyncio.create_task(setup_subreddit(sub.display_name))
 
-# ══════════════════════════════════════════════════════════
-#  Per-subreddit setup  (async, closure-based)
-# ══════════════════════════════════════════════════════════
+        except Exception as e:
+            print(f"[REGISTRY] Sync thread error: {e}")
 
-async def setup_subreddit(reddit, session: aiohttp.ClientSession, sub_name: str) -> None:
-    print(f"\n=== Setting up r/{sub_name} ===")
-    subreddit = reddit.subreddit(sub_name)
-    loop      = asyncio.get_running_loop()
+        await asyncio.sleep(300) 
 
-    data: dict = {
-        'subreddit':                      subreddit,
-        'image_hashes':                   {},   # hash_str → (id, created_utc)
-        'orb_descriptors':                {},   # submission_id → descriptors
-        'moderator_removed_hashes':       set(),
+# =========================
+# Heavy CPU Math Isolation
+# =========================
+def _process_image_cpu(image_data):
+    """Runs purely in a background thread to prevent blocking the async loop"""
+    img = np.asarray(bytearray(image_data), dtype=np.uint8)
+    img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+    
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hash_value = str(imagehash.phash(Image.fromarray(gray)))
+    
+    def is_problematic_image(img_chk, white_threshold=0.7, text_threshold=0.05):
+        white_ratio = np.mean(gray > 240)
+        if white_ratio > white_threshold: return True
+        edges = cv2.Canny(gray, 100, 200)
+        return np.mean(edges > 0) > text_threshold
+
+    def get_orb_descriptors_conditional(img_chk):
+        if is_problematic_image(img_chk):
+            _, processed_img = cv2.threshold(gray, 240, 255, cv2.THRESH_TOZERO_INV)
+            processed_img = cv2.Canny(processed_img, 100, 200)
+        else:
+            processed_img = cv2.cvtColor(img_chk, cv2.COLOR_BGR2GRAY)
+        kp, des = orb_detector.detectAndCompute(processed_img, None)
+        return des
+
+    def get_ai_features(img_chk):
+        try:
+            img_pil = Image.fromarray(cv2.cvtColor(img_chk, cv2.COLOR_BGR2RGB))
+            img_tensor = efficientnet_transform(img_pil).unsqueeze(0).to(device)
+            with torch.no_grad():
+                feat = efficientnet_model(img_tensor)
+                feat = feat / feat.norm(dim=1, keepdim=True)
+            return feat
+        except Exception as e:
+            print(f"AI feature extraction error: {e}")
+            return None
+
+    descriptors = get_orb_descriptors_conditional(img)
+    features = get_ai_features(img)
+    return img, hash_value, descriptors, features
+
+# =========================
+# Shared Duplicate Bot logic
+# =========================
+async def setup_subreddit(subreddit_name):
+    print(f"\n=== Setting up bot for r/{subreddit_name} ===")
+    
+    subreddit = await reddit.subreddit(subreddit_name)
+    
+    data = {
+        'subreddit': subreddit,
+        'image_hashes': {},
+        'orb_descriptors': {},
+        'moderator_removed_hashes': set(),
         'processed_modqueue_submissions': set(),
-        'approved_by_moderator':          set(),
-        'ai_features':                    {},   # submission_id → tensor
-        'current_time':                   int(time.time()),
-        'processed_log_items':            set(),
-        'last_checked':                   {},
+        'approved_by_moderator': set(),
+        'ai_features': {},
+        'current_time': int(time.time()),
+        'processed_log_items': set(),
+        'last_checked': {}
     }
-    async with subreddit_data_lock:
-        subreddit_data[sub_name] = data
+    
+    subreddit_data[subreddit_name] = data
+    
+    def orb_similarity(desc1, desc2):
+        if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
+            return 0
+        matches = bf_matcher.match(desc1, desc2)
+        return len(matches) / min(len(desc1), len(desc2))
 
-    # ── Closure helpers ────────────────────────────────────
+    def format_age(utc_timestamp):
+        now = datetime.now(timezone.utc)
+        created = datetime.fromtimestamp(utc_timestamp, tz=timezone.utc)
+        delta = now - created
+        days = delta.days
+        seconds = delta.seconds
+        if days > 0: return f"{days} day{'s' if days != 1 else ''} ago"
+        elif seconds >= 3600: return f"{seconds // 3600} hour{'s' if seconds // 3600 != 1 else ''} ago"
+        elif seconds >= 60: return f"{seconds // 60} minute{'s' if seconds // 60 != 1 else ''} ago"
+        else: return f"{seconds} second{'s' if seconds != 1 else ''} ago"
 
-    def _format_age(utc: float) -> str:
-        delta = datetime.now(timezone.utc) - datetime.fromtimestamp(utc, tz=timezone.utc)
-        d, s  = delta.days, delta.seconds
-        if d:         return f"{d} day{'s' if d != 1 else ''} ago"
-        if s >= 3600: return f"{s//3600} hour{'s' if s//3600 != 1 else ''} ago"
-        if s >= 60:   return f"{s//60} minute{'s' if s//60 != 1 else ''} ago"
-        return        f"{s} second{'s' if s != 1 else ''} ago"
-
-    async def _post_comment(submission, author, title, date, utc, status, permalink):
-        for _ in range(3):
+    async def post_comment(submission, original_post_author, original_post_title, original_post_date, original_post_utc, original_status, original_post_permalink):
+        max_retries = 3
+        retries = 0
+        age_text = format_age(original_post_utc)
+        while retries < max_retries:
             try:
-                text = (
+                comment_text = (
                     "> **Duplicate detected**\n\n"
                     "| Original Author | Title | Date | Age | Status |\n"
                     "|:---------------:|:-----:|:----:|:---:|:------:|\n"
-                    f"| {author} | [{title}]({permalink}) | {date}"
-                    f" | {_format_age(utc)} | {status} |"
+                    f"| {original_post_author} | [{original_post_title}]({original_post_permalink}) | {original_post_date} | {age_text} | {original_status} |"
                 )
-                comment = await submission.reply(text)
+                comment = await submission.reply(comment_text)
                 await comment.mod.distinguish(sticky=True)
-                print(f"[r/{sub_name}] Duplicate comment posted: {submission.url}")
+                print(f"[r/{subreddit_name}] Duplicate removed and comment posted: ", submission.url)
                 return True
             except Exception as e:
                 handle_exception(e)
+                retries += 1
                 await asyncio.sleep(1)
         return False
 
-    async def _cached_features(submission_id: str):
-        """Return cached AI features, or download + compute them on cache miss."""
+    async def load_and_process_image(url):
+        async with http_session.get(url, timeout=10) as response:
+            image_data = await response.read()
+        
+        img, hash_value, descriptors, features = await asyncio.to_thread(_process_image_cpu, image_data)
+        print(f"[r/{subreddit_name}] Generated hash: {hash_value}")
+        return img, hash_value, descriptors, features
+
+    async def get_cached_ai_features(submission_id):
         if submission_id in data['ai_features']:
             return data['ai_features'][submission_id]
-        sub = await reddit.submission(id=submission_id)
-        async with session.get(sub.url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            image_bytes = await resp.read()
-        feat = await loop.run_in_executor(cpu_executor, _cpu_decode_and_get_features, image_bytes)
-        data['ai_features'][submission_id] = feat
-        return feat
+        
+        old_submission = await reddit.submission(id=submission_id)
+        await old_submission.load()
+        async with http_session.get(old_submission.url, timeout=10) as response:
+            old_image_data = await response.read()
+            
+        _, _, _, old_features = await asyncio.to_thread(_process_image_cpu, old_image_data)
+        data['ai_features'][submission_id] = old_features
+        return old_features
 
-    async def _check_hash(submission, h_val, new_feat):
-        """
-        Check for a perceptual-hash duplicate.
-        Returns a 7-tuple: (is_dup, author, title, date, utc, status, permalink).
-        """
-        matched = None
-        for stored in data['image_hashes']:
-            if h_val == stored or (imagehash.hex_to_hash(h_val) - imagehash.hex_to_hash(stored)) <= 3:
-                matched = stored
+    def calculate_ai_similarity(features1, features2):
+        if features1 is not None and features2 is not None:
+            return (features1 @ features2.T).item()
+        return 0
+
+    async def check_hash_duplicate(submission, hash_value, new_features):
+        matched_hash = None
+        for stored_hash in data['image_hashes'].keys():
+            if hash_value == stored_hash or (imagehash.hex_to_hash(hash_value) - imagehash.hex_to_hash(stored_hash)) <= 3:
+                matched_hash = stored_hash
                 break
-        if not matched:
+        
+        if matched_hash is None:
             return False, None, None, None, None, None, None
-
-        orig_id, orig_time = data['image_hashes'][matched]
-        if submission.id == orig_id or submission.created_utc <= orig_time:
+        
+        original_id, original_time = data['image_hashes'][matched_hash]
+        if submission.id == original_id or submission.created_utc <= original_time:
             return False, None, None, None, None, None, None
-
-        orig_sub  = await reddit.submission(id=orig_id)
-        orig_feat = await _cached_features(orig_id)
-        score     = await loop.run_in_executor(cpu_executor, _cpu_ai_similarity, new_feat, orig_feat)
-        print(f"[r/{sub_name}] Hash match. AI score: {score:.2f}")
-
-        if score > 0.50:
-            date   = datetime.utcfromtimestamp(orig_sub.created_utc).strftime('%Y-%m-%d %H:%M:%S')
-            status = "Removed by Moderator" if matched in data['moderator_removed_hashes'] else "Active"
-            author = orig_sub.author
-            return (True, author.name if author else "[deleted]",
-                    orig_sub.title, date, orig_sub.created_utc, status, orig_sub.permalink)
+        
+        original_submission = await reddit.submission(id=original_id)
+        await original_submission.load()
+        original_features = await get_cached_ai_features(original_submission.id)
+        
+        ai_score = calculate_ai_similarity(new_features, original_features)
+        print(f"[r/{subreddit_name}] Hash match detected. AI similarity: {ai_score:.2f}")
+        
+        if ai_score > 0.50:
+            original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+            original_status = "Removed by Moderator" if matched_hash in data['moderator_removed_hashes'] else "Active"
+            author_name = original_submission.author.name if original_submission.author else "[Deleted]"
+            return True, author_name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
+        
         return False, None, None, None, None, None, None
 
-    async def _check_orb(submission, descs, new_feat):
-        """
-        Check for an ORB-feature duplicate.
-        All ORB similarity scores are computed in parallel in the executor,
-        then AI scores are checked only for candidates above the ORB threshold.
-        Returns same 7-tuple as _check_hash.
-        """
-        if not data['orb_descriptors'] or descs is None:
-            return False, None, None, None, None, None, None
-
-        items = list(data['orb_descriptors'].items())
-
-        # Fan all ORB comparisons out to the CPU thread pool simultaneously
-        sims = await asyncio.gather(*[
-            loop.run_in_executor(cpu_executor, _cpu_orb_similarity, descs, old_desc)
-            for _, old_desc in items
-        ])
-
-        for (old_id, _), sim in zip(items, sims):
+    async def check_orb_duplicate(submission, descriptors, new_features):
+        for old_id, old_desc in data['orb_descriptors'].items():
+            sim = orb_similarity(descriptors, old_desc)
             if sim > 0.50:
-                old_feat = await _cached_features(old_id)
-                score    = await loop.run_in_executor(cpu_executor, _cpu_ai_similarity, new_feat, old_feat)
-                if score > 0.75:
-                    orig_sub = await reddit.submission(id=old_id)
-                    date     = datetime.utcfromtimestamp(orig_sub.created_utc).strftime('%Y-%m-%d %H:%M:%S')
+                old_features = await get_cached_ai_features(old_id)
+                ai_score = calculate_ai_similarity(new_features, old_features)
+                
+                if ai_score > 0.75:
+                    print(f"[r/{subreddit_name}] ORB duplicate found! AI similarity: {ai_score:.2f}")
+                    original_submission = await reddit.submission(id=old_id)
+                    await original_submission.load()
+                    original_post_date = datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S')
                     old_hash = next((h for h, v in data['image_hashes'].items() if v[0] == old_id), None)
-                    status   = "Removed by Moderator" if old_hash in data['moderator_removed_hashes'] else "Active"
-                    author   = orig_sub.author
-                    return (True, author.name if author else "[deleted]",
-                            orig_sub.title, date, orig_sub.created_utc, status, orig_sub.permalink)
+                    original_status = "Removed by Moderator" if old_hash and old_hash in data['moderator_removed_hashes'] else "Active"
+                    author_name = original_submission.author.name if original_submission.author else "[Deleted]"
+                    
+                    return True, author_name, original_submission.title, original_post_date, original_submission.created_utc, original_status, original_submission.permalink
         return False, None, None, None, None, None, None
 
-    async def process_submission(submission, context="stream"):
+    async def handle_duplicate(submission, is_hash_dup, detection_method, author, title, date, utc, status, permalink):
+        if not submission.approved:
+            await submission.mod.remove()
+            await post_comment(submission, author, title, date, utc, status, permalink)
+            print(f"[r/{subreddit_name}] Duplicate removed by {detection_method}: {submission.url}")
+        return True
+
+    async def handle_moderator_removed_repost(submission, hash_value):
+        if hash_value in data['moderator_removed_hashes'] and not submission.approved:
+            await submission.mod.remove()
+            original_submission = await reddit.submission(id=data['image_hashes'][hash_value][0])
+            await original_submission.load()
+            author_name = original_submission.author.name if original_submission.author else "[Deleted]"
+            await post_comment(
+                submission,
+                author_name,
+                original_submission.title,
+                datetime.utcfromtimestamp(original_submission.created_utc).strftime('%Y-%m-%d %H:%M:%S'),
+                original_submission.created_utc,
+                "Removed by Moderator",
+                original_submission.permalink
+            )
+            print(f"[r/{subreddit_name}] Repost of a moderator-removed image removed: ", submission.url)
+            return True
+        return False
+
+    async def process_submission_for_duplicates(submission, context="stream"):
         try:
-            _, h_val, descs, new_feat = await fetch_and_process_image(session, submission.url)
-            data['ai_features'][submission.id] = new_feat
-
-            # 1. Repost of a moderator-removed image
-            if h_val in data['moderator_removed_hashes'] and not submission.approved:
-                orig_id  = data['image_hashes'][h_val][0]
-                orig_sub = await reddit.submission(id=orig_id)
-                author   = orig_sub.author
-                date     = datetime.utcfromtimestamp(orig_sub.created_utc).strftime('%Y-%m-%d %H:%M:%S')
-                await submission.mod.remove()
-                await _post_comment(
-                    submission,
-                    author.name if author else "[deleted]",
-                    orig_sub.title, date, orig_sub.created_utc,
-                    "Removed by Moderator", orig_sub.permalink
-                )
-                print(f"[r/{sub_name}] Repost of mod-removed image blocked: {submission.url}")
+            img, hash_value, descriptors, new_features = await load_and_process_image(submission.url)
+            data['ai_features'][submission.id] = new_features
+            
+            if await handle_moderator_removed_repost(submission, hash_value):
                 return True
-
-            # 2. Hash duplicate
-            found, *args = await _check_hash(submission, h_val, new_feat)
-            if found:
-                if not submission.approved:
-                    await submission.mod.remove()
-                    await _post_comment(submission, *args)
-                    print(f"[r/{sub_name}] Hash+AI duplicate removed: {submission.url}")
-                return True
-
-            # 3. ORB duplicate
-            found, *args = await _check_orb(submission, descs, new_feat)
-            if found:
-                if not submission.approved:
-                    await submission.mod.remove()
-                    await _post_comment(submission, *args)
-                    print(f"[r/{sub_name}] ORB+AI duplicate removed: {submission.url}")
-                return True
-
-            # 4. Store as original
-            if h_val not in data['image_hashes']:
-                data['image_hashes'][h_val]           = (submission.id, submission.created_utc)
-                data['orb_descriptors'][submission.id] = descs
-                data['ai_features'][submission.id]     = new_feat
-                print(f"[r/{sub_name}] Stored new original: {submission.url}")
-
+            
+            is_duplicate, author, title, date, utc, status, permalink = await check_hash_duplicate(
+                submission, hash_value, new_features
+            )
+            if is_duplicate:
+                return await handle_duplicate(submission, True, "hash + AI", author, title, date, utc, status, permalink)
+            
+            is_duplicate, author, title, date, utc, status, permalink = await check_orb_duplicate(
+                submission, descriptors, new_features
+            )
+            if is_duplicate:
+                return await handle_duplicate(submission, False, "ORB + AI", author, title, date, utc, status, permalink)
+            
+            if hash_value not in data['image_hashes']:
+                data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
+                data['orb_descriptors'][submission.id] = descriptors
+                data['ai_features'][submission.id] = new_features
+                print(f"[r/{subreddit_name}] Stored new original: {submission.url}")
+            
             if context == "modqueue" and not submission.approved:
                 await submission.mod.approve()
-                print(f"[r/{sub_name}] Original approved from modqueue: {submission.url}")
+                print(f"[r/{subreddit_name}] Original submission approved: ", submission.url)
+            
             return False
-
+            
         except Exception as e:
             handle_exception(e)
             return False
 
-    data['process_submission'] = process_submission
-
-    # Initial scan
-    print(f"[r/{sub_name}] Initial scan starting...")
+    data['process_submission'] = process_submission_for_duplicates
+    
+    print(f"[r/{subreddit_name}] Starting initial scan...")
     try:
-        async for s in subreddit.new(limit=20):
-            if isinstance(s, asyncpraw.models.Submission) and \
-                    s.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+        async for submission in subreddit.new(limit=20):
+            if isinstance(submission, asyncpraw.models.Submission) and submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                print(f"[r/{subreddit_name}] Indexing submission (initial scan): ", submission.url)
                 try:
-                    _, h_val, descs, feat = await fetch_and_process_image(session, s.url)
-                    if h_val not in data['image_hashes']:
-                        data['image_hashes'][h_val]       = (s.id, s.created_utc)
-                        data['orb_descriptors'][s.id]      = descs
-                        data['ai_features'][s.id]          = feat
+                    img, hash_value, descriptors, features = await load_and_process_image(submission.url)
+                    if hash_value not in data['image_hashes']:
+                        data['image_hashes'][hash_value] = (submission.id, submission.created_utc)
+                        data['orb_descriptors'][submission.id] = descriptors
+                        data['ai_features'][submission.id] = features
                 except Exception as e:
                     handle_exception(e)
     except Exception as e:
         handle_exception(e)
-    print(f"[r/{sub_name}] Setup complete. Indexed {len(data['image_hashes'])} images.")
+    
+    print(f"[r/{subreddit_name}] Initial scan complete. Indexed {len(data['image_hashes'])} images.")
+    print(f"[r/{subreddit_name}] Bot setup complete!\n")
 
-
-# ══════════════════════════════════════════════════════════
-#  Task: registry sync  (invites + subreddit registration)
-# ══════════════════════════════════════════════════════════
-
-async def task_sync_subreddits(reddit, session: aiohttp.ClientSession) -> None:
+# =========================
+# Dynamic Workers
+# =========================
+async def monitor_reported_posts():
     while True:
         try:
-            async for msg in reddit.inbox.unread(limit=None):
-                if "invitation to moderate" in msg.subject.lower():
-                    sub = getattr(msg, 'subreddit', None)
-                    if sub:
-                        try:
-                            await sub.mod.accept_invite()
-                            await msg.mark_read()
-                            print(f"[REGISTRY] Accepted invite to r/{sub.display_name}")
-                        except Exception as e:
-                            print(f"[REGISTRY] Invite accept error: {e}")
-
-            async for sub in reddit.user.moderator_subreddits(limit=None):
-                await sync_subreddit_rules_and_config(sub)
-                async with subreddit_data_lock:
-                    already = sub.display_name in subreddit_data
-                if not already:
-                    print(f"[REGISTRY] Registering r/{sub.display_name}")
-                    asyncio.create_task(setup_subreddit(reddit, session, sub.display_name))
-
-        except Exception as e:
-            print(f"[REGISTRY] Sync error: {e}")
-
-        await asyncio.sleep(300)
-
-
-# ══════════════════════════════════════════════════════════
-#  Task: modqueue router  (1 fetch → 5 concurrent handlers)
-#
-#  Previously: 4 separate threads each calling modqueue() independently.
-#  Now:        1 coroutine fetches once per cycle, then fans the item list
-#              out to 5 handlers that run concurrently via asyncio.gather().
-# ══════════════════════════════════════════════════════════
-
-async def task_modqueue_router(reddit) -> None:
-    timers: dict = {}
-    while True:
-        try:
-            items = [item async for item in reddit.subreddit('mod').mod.modqueue(limit=100)]
-            await asyncio.gather(
-                _mq_handle_timers(items, timers),
-                _mq_comment_removals(items),
-                _mq_comment_approvals(items),
-                _mq_post_removals(items),
-                _mq_post_approvals(items),
-            )
+            subreddit_mod = await reddit.subreddit('mod')
+            async for post in subreddit_mod.mod.reports():
+                if getattr(post, "approved", False):
+                    await post.mod.approve()
+                    print(f"[r/{post.subreddit.display_name}] Post {post.id} has been approved again")
         except Exception as e:
             handle_exception(e)
             await asyncio.sleep(60)
-        await asyncio.sleep(30)
 
-async def _mq_handle_timers(items, timers: dict) -> None:
-    """Auto-approve single-report posts after 1 hour (original handle_modqueue_items logic)."""
-    item_ids_in_queue = {item.id for item in items}
-    # Clean up timers for items that left the modqueue
-    for stale_id in list(timers):
-        if stale_id not in item_ids_in_queue:
-            del timers[stale_id]
-
-    for item in items:
-        sub = item.subreddit.display_name
-        if getattr(item, "num_reports", 0) == 1 and item.id not in timers:
-            timers[item.id] = time.time()
-            print(f"[r/{sub}] Timer started for {item.id}")
-        if item.id in timers and time.time() - timers[item.id] >= 3600:
-            try:
-                await item.mod.approve()
-                del timers[item.id]
-                print(f"[r/{sub}] Auto-approved {item.id} (1 report, 1 h elapsed)")
-            except Exception as e:
-                handle_exception(e)
-
-async def _mq_comment_removals(items) -> None:
-    for item in items:
-        if not isinstance(item, asyncpraw.models.Comment):
-            continue
-        sub = item.subreddit.display_name
-        for reason, count in getattr(item, "user_reports", []):
-            thr = get_action_threshold(sub, reason, 'comment_remove')
-            if thr > 0 and count >= thr:
-                try:
-                    await item.mod.remove()
-                    print(f"[r/{sub}] Comment removed: {count} reports for '{reason}'")
-                    break
-                except Exception as e:
-                    handle_exception(e)
-
-async def _mq_comment_approvals(items) -> None:
-    for item in items:
-        if not isinstance(item, asyncpraw.models.Comment):
-            continue
-        sub = item.subreddit.display_name
-        for reason, count in getattr(item, "user_reports", []):
-            thr = get_action_threshold(sub, reason, 'comment_approve')
-            if thr > 0 and count >= thr:
-                try:
-                    await item.mod.approve()
-                    print(f"[r/{sub}] Comment approved: {count} reports for '{reason}'")
-                    break
-                except Exception as e:
-                    handle_exception(e)
-
-async def _mq_post_removals(items) -> None:
-    for item in items:
-        if not isinstance(item, asyncpraw.models.Submission):
-            continue
-        sub = item.subreddit.display_name
-        for reason, count in getattr(item, "user_reports", []):
-            thr = get_action_threshold(sub, reason, 'post_remove')
-            if thr > 0 and count >= thr:
-                try:
-                    await item.mod.remove()
-                    print(f"[r/{sub}] Post removed: {count} reports for '{reason}'")
-                    break
-                except Exception as e:
-                    handle_exception(e)
-
-async def _mq_post_approvals(items) -> None:
-    for item in items:
-        if not isinstance(item, asyncpraw.models.Submission):
-            continue
-        sub = item.subreddit.display_name
-        for reason, count in getattr(item, "user_reports", []):
-            thr = get_action_threshold(sub, reason, 'post_approve')
-            if thr > 0 and count >= thr:
-                try:
-                    await item.mod.approve()
-                    print(f"[r/{sub}] Post approved: {count} reports for '{reason}'")
-                    break
-                except Exception as e:
-                    handle_exception(e)
-
-
-# ══════════════════════════════════════════════════════════
-#  Task: spoiler monitor
-# ══════════════════════════════════════════════════════════
-
-async def task_spoiler_monitor(reddit) -> None:
-    prev_status: dict = {}
+async def handle_modqueue_items():
+    timers = {}
     while True:
         try:
-            async for submission in reddit.subreddit('mod').new(limit=100):
-                sub = submission.subreddit.display_name
-                if submission.id not in prev_status:
-                    prev_status[submission.id] = submission.spoiler
-                    continue
-                if prev_status[submission.id] and not submission.spoiler:
-                    mod_did_it = False
-                    try:
-                        async for log in submission.subreddit.mod.log(action='unspoiler', limit=5):
-                            if log.target_fullname == submission.fullname:
-                                mod_did_it = True
-                                print(f"[r/{sub}] Mod {log.mod} unspoilered {submission.id}. OK.")
-                                break
-                    except Exception as e:
-                        print(f"[r/{sub}] Spoiler log error: {e}")
-                    if not mod_did_it:
+            subreddit_mod = await reddit.subreddit('mod')
+            async for item in subreddit_mod.mod.modqueue():
+                sub_name = item.subreddit.display_name
+                if getattr(item, "num_reports", 0) == 1 and item.id not in timers:
+                    created_time = getattr(item, "created_utc", time.time())
+                    timers[item.id] = time.time()
+                    print(f"[r/{sub_name}] Starting timer for post {item.id} (created {created_time})...")
+
+                if item.id in timers:
+                    start_time = timers[item.id]
+                    time_diff = time.time() - start_time
+                    if time_diff >= 3600:
                         try:
+                            await item.mod.approve()
+                            print(f"[r/{sub_name}] Approved post {item.id} with one report")
+                            del timers[item.id]
+                        except asyncprawcore.exceptions.ServerError as se:
+                            handle_exception(se)
+                    else:
+                        new_reports = getattr(item, "report_reasons", None)
+                        if new_reports != getattr(item, "report_reasons", None):
+                            print(f"[r/{sub_name}] New reports for post {item.id}, leaving post in mod queue")
+                            del timers[item.id]
+                        else:
+                            time_remaining = int(start_time + 3600 - time.time())
+                            print(f"[r/{sub_name}] Time remaining for post {item.id}: {time_remaining} seconds")
+        except Exception as e:
+            handle_exception(e)
+            await asyncio.sleep(60)
+
+async def handle_spoiler_status():
+    previous_spoiler_status = {}
+    while True:
+        try:
+            subreddit_mod = await reddit.subreddit('mod')
+            async for submission in subreddit_mod.new(limit=100):
+                sub_name = submission.subreddit.display_name
+                
+                if submission.id not in previous_spoiler_status:
+                    previous_spoiler_status[submission.id] = submission.spoiler
+                    continue
+
+                if previous_spoiler_status[submission.id] and not submission.spoiler:
+                    mod_unspoilered = False
+                    try:
+                        sub_obj = await reddit.subreddit(sub_name)
+                        async for log in sub_obj.mod.log(action='unspoiler', limit=5):
+                            if log.target_fullname == submission.fullname:
+                                mod_unspoilered = True
+                                print(f"[r/{sub_name}] Mod: {log.mod}, Subreddit: {log.subreddit} - Unspoilered post {submission.id}.")
+                                break
+                    except Exception as log_e:
+                        print(f"[r/{sub_name}] Error checking mod logs for post {submission.id}: {log_e}")
+
+                    if not mod_unspoilered:
+                        try:
+                            print(f'[r/{sub_name}] Post {submission.id} unspoilered without mod log entry. Re-marking as spoiler.')
                             await submission.mod.spoiler()
-                            print(f"[r/{sub}] Re-spoilered {submission.id} (no mod log entry).")
-                        except Exception as e:
-                            handle_exception(e)
-                prev_status[submission.id] = submission.spoiler
+                        except asyncprawcore.exceptions.ServerError as se:
+                            handle_exception(se)
+                    else:
+                        print(f'[r/{sub_name}] Post {submission.id} unspoilered by a moderator. Leaving as-is.')
+
+                previous_spoiler_status[submission.id] = submission.spoiler
         except Exception as e:
             handle_exception(e)
             await asyncio.sleep(10)
-        await asyncio.sleep(5)
 
-
-# ══════════════════════════════════════════════════════════
-#  Task: re-approve already-approved reported posts
-# ══════════════════════════════════════════════════════════
-
-async def task_monitor_reported_posts(reddit) -> None:
+async def handle_user_reports_and_removal():
     while True:
         try:
-            async for post in reddit.subreddit('mod').mod.reports():
-                if getattr(post, "approved", False):
-                    await post.mod.approve()
-                    print(f"[r/{post.subreddit.display_name}] Re-approved {post.id}")
+            subreddit_mod = await reddit.subreddit('mod')
+            async for comment in subreddit_mod.mod.modqueue(limit=100):
+                if isinstance(comment, asyncpraw.models.Comment) and getattr(comment, "user_reports", None):
+                    sub_name = comment.subreddit.display_name
+                    for report in comment.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'comment_remove')
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                await comment.mod.remove()
+                                print(f'[r/{sub_name}] Comment removed due to {count} reports for reason: {reason}')
+                                break
+                            except asyncprawcore.exceptions.ServerError as se:
+                                handle_exception(se)
         except Exception as e:
             handle_exception(e)
             await asyncio.sleep(60)
-        await asyncio.sleep(5)
 
-
-# ══════════════════════════════════════════════════════════
-#  Task: mod log monitor  (all subreddits concurrently)
-# ══════════════════════════════════════════════════════════
-
-async def task_mod_log_monitor(reddit) -> None:
+async def handle_submissions_based_on_user_reports():
     while True:
         try:
-            async with subreddit_data_lock:
-                subs = list(subreddit_data.keys())
-
-            async def _check_one_mod_log(sub_name: str):
-                d = subreddit_data[sub_name]
-                try:
-                    async for log in d['subreddit'].mod.log(action='removelink', limit=50):
-                        if log.id in d['processed_log_items']:
-                            continue
-                        d['processed_log_items'].add(log.id)
-                        removed_id = log.target_fullname.replace('t3_', '')
-                        for h, (sid, _) in list(d['image_hashes'].items()):
-                            if sid == removed_id and h not in d['moderator_removed_hashes']:
-                                d['moderator_removed_hashes'].add(h)
-                                print(f"[r/{sub_name}] [MOD REMOVE] {removed_id} flagged.")
+            subreddit_mod = await reddit.subreddit('mod')
+            async for post in subreddit_mod.mod.modqueue(limit=100):
+                if isinstance(post, asyncpraw.models.Submission) and getattr(post, "user_reports", None):
+                    sub_name = post.subreddit.display_name
+                    for report in post.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'post_approve')
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                await post.mod.approve()
+                                print(f'[r/{sub_name}] Post "{post.title}" approved due to {count} reports for reason: {reason}')
                                 break
-                        if len(d['processed_log_items']) > 1000:
-                            d['processed_log_items'].clear()
-                except Exception as e:
-                    print(f"[r/{sub_name}] Mod log error: {e}")
-
-            await asyncio.gather(*(_check_one_mod_log(s) for s in subs))
-
+                            except asyncprawcore.exceptions.ServerError as se:
+                                handle_exception(se)
         except Exception as e:
-            print(f"Mod log monitor error: {e}")
-        await asyncio.sleep(30)
+            handle_exception(e)
+            await asyncio.sleep(60)
 
-
-# ══════════════════════════════════════════════════════════
-#  Task: removal / user-deletion checker
-# ══════════════════════════════════════════════════════════
-
-async def task_removal_checker(reddit) -> None:
+async def handle_posts_based_on_removal():
     while True:
         try:
-            async with subreddit_data_lock:
-                subs = list(subreddit_data.keys())
+            subreddit_mod = await reddit.subreddit('mod')
+            async for post in subreddit_mod.mod.modqueue(limit=100):
+                if isinstance(post, asyncpraw.models.Submission) and getattr(post, "user_reports", None):
+                    sub_name = post.subreddit.display_name
+                    for report in post.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'post_remove')
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                await post.mod.remove()
+                                print(f'[r/{sub_name}] Submission "{post.title}" removed due to {count} reports for reason: {reason}')
+                                break
+                            except asyncprawcore.exceptions.ServerError as se:
+                                handle_exception(se)
+        except Exception as e:
+            handle_exception(e)
+            await asyncio.sleep(60)
 
-            async def _check_one_removal(sub_name: str):
-                d   = subreddit_data[sub_name]
-                now = time.time()
+async def handle_comments_based_on_approval():
+    while True:
+        try:
+            subreddit_mod = await reddit.subreddit('mod')
+            async for comment in subreddit_mod.mod.modqueue(limit=100):
+                if getattr(comment, "user_reports", None):
+                    sub_name = comment.subreddit.display_name
+                    for report in comment.user_reports:
+                        reason = report[0]
+                        count = report[1]
+                        
+                        threshold = get_action_threshold(sub_name, reason, 'comment_approve')
+                        if threshold > 0 and count >= threshold:
+                            try:
+                                await comment.mod.approve()
+                                print(f'[r/{sub_name}] Comment "{comment.body}" approved due to {count} reports for reason: {reason}')
+                                break
+                            except asyncprawcore.exceptions.ServerError as se:
+                                handle_exception(se)
+        except Exception as e:
+            handle_exception(e)
+            await asyncio.sleep(60)
 
-                def _interval(creation_time):
-                    age = now - creation_time
-                    return 30 if age < 3600 else (300 if age < 86400 else 1800)
-
-                to_check = [
-                    (h, sid)
-                    for h, (sid, ct) in d['image_hashes'].items()
-                    if h not in d['moderator_removed_hashes']
-                    and now - d['last_checked'].get(sid, 0) >= _interval(ct)
-                ]
-                recent = [t for t in to_check if now - d['image_hashes'][t[0]][1] <  3600]
-                medium = [t for t in to_check if 3600  <= now - d['image_hashes'][t[0]][1] < 86400][:20]
-                old    = [t for t in to_check if 86400 <= now - d['image_hashes'][t[0]][1]][:10]
-
-                async def _verify(h, sid):
+async def run_pokemon_duplicate_bot():
+    
+    async def shared_mod_log_monitor():
+        while True:
+            try:
+                subreddits = list(subreddit_data.keys())
+                for subreddit_name in subreddits:
                     try:
-                        sub = await reddit.submission(id=sid)
-                        if sub.author is None:
-                            d['image_hashes'].pop(h, None)
-                            d['orb_descriptors'].pop(sid, None)
-                            d['ai_features'].pop(sid, None)
-                            d['last_checked'].pop(sid, None)
-                            print(f"[r/{sub_name}] [USER DELETE] {sid} cleaned up.")
-                        else:
-                            d['last_checked'][sid] = now
+                        data = subreddit_data[subreddit_name]
+                        subreddit = data['subreddit']
+                        
+                        async for log_entry in subreddit.mod.log(action='removelink', limit=50):
+                            if log_entry.id in data['processed_log_items']:
+                                continue
+                            
+                            data['processed_log_items'].add(log_entry.id)
+                            removed_submission_id = log_entry.target_fullname.replace('t3_', '')
+                            
+                            hash_to_process = None
+                            for hash_value, (submission_id, creation_time) in list(data['image_hashes'].items()):
+                                if submission_id == removed_submission_id:
+                                    hash_to_process = hash_value
+                                    break
+                            
+                            if hash_to_process and hash_to_process not in data['moderator_removed_hashes']:
+                                data['moderator_removed_hashes'].add(hash_to_process)
+                                print(f"[r/{subreddit_name}] [MOD REMOVE] Submission {removed_submission_id} removed by moderator. Hash kept for future duplicate detection.")
+                            
+                            if len(data['processed_log_items']) > 1000:
+                                data['processed_log_items'].clear()
+                    
                     except Exception as e:
-                        print(f"[r/{sub_name}] Verify error {sid}: {e}")
-                        d['last_checked'][sid] = now
+                        print(f"[r/{subreddit_name}] Error in mod log check: {e}")
+            except Exception as e:
+                print(f"Error in shared mod log monitor: {e}")
+            await asyncio.sleep(30)
+    
+    async def shared_removal_checker():
+        while True:
+            try:
+                subreddits = list(subreddit_data.keys())
+                for subreddit_name in subreddits:
+                    try:
+                        data = subreddit_data[subreddit_name]
+                        current_check_time = time.time()
+                        checked_this_cycle = 0
+                        
+                        recent_submissions = []
+                        medium_submissions = []
+                        old_submissions = []
+                        
+                        for hash_value, (submission_id, creation_time) in list(data['image_hashes'].items()):
+                            if hash_value in data['moderator_removed_hashes']: continue
+                            age = current_check_time - creation_time
+                            last_check = data['last_checked'].get(submission_id, 0)
+                            
+                            if age < 3600 and current_check_time - last_check >= 30:
+                                recent_submissions.append((hash_value, submission_id))
+                            elif age < 86400 and current_check_time - last_check >= 300:
+                                medium_submissions.append((hash_value, submission_id))
+                            elif age >= 86400 and current_check_time - last_check >= 1800:
+                                old_submissions.append((hash_value, submission_id))
+                        
+                        all_to_check = recent_submissions + medium_submissions[:20] + old_submissions[:10]
+                        
+                        for hash_value, submission_id in all_to_check:
+                            try:
+                                original_submission = await reddit.submission(id=submission_id)
+                                await original_submission.load()
+                                original_author = getattr(original_submission, "author", None)
+                                
+                                if original_author is None:
+                                    data['image_hashes'].pop(hash_value, None)
+                                    data['orb_descriptors'].pop(submission_id, None)
+                                    data['ai_features'].pop(submission_id, None)
+                                    data['last_checked'].pop(submission_id, None)
+                                    print(f"[r/{subreddit_name}] [USER DELETE] Submission {submission_id} deleted by user. Hash removed.")
+                                else:
+                                    data['last_checked'][submission_id] = current_check_time
+                                
+                                checked_this_cycle += 1
+                                if checked_this_cycle >= 10:
+                                    await asyncio.sleep(60)
+                                    checked_this_cycle = 0
+                                
+                            except Exception as e:
+                                print(f"[r/{subreddit_name}] Error checking submission {submission_id}: {e}")
+                                data['last_checked'][submission_id] = current_check_time
+                    except Exception as e:
+                        print(f"[r/{subreddit_name}] Error in removal check: {e}")
+            except Exception as e:
+                print(f"Error in shared removal checker: {e}")
+            await asyncio.sleep(60)
+    
+    async def shared_modqueue_worker():
+        while True:
+            try:
+                subreddits = list(subreddit_data.keys())
+                for subreddit_name in subreddits:
+                    try:
+                        data = subreddit_data[subreddit_name]
+                        subreddit = data['subreddit']
+                        
+                        modqueue_submissions = []
+                        async for s in subreddit.mod.modqueue(only='submission', limit=None):
+                            modqueue_submissions.append(s)
+                            
+                        modqueue_submissions = sorted(modqueue_submissions, key=lambda x: getattr(x, 'created_utc', 0))
+                        
+                        for submission in modqueue_submissions:
+                            if not isinstance(submission, asyncpraw.models.Submission): continue
+                            print(f"[r/{subreddit_name}] Scanning Mod Queue: ", submission.url)
+                            
+                            if getattr(submission, "num_reports", 0) > 0:
+                                print(f"[r/{subreddit_name}] Skipping reported image: ", submission.url)
+                                data['image_hashes'] = {k: v for k, v in data['image_hashes'].items() if v[0] != submission.id}
+                                data['orb_descriptors'].pop(submission.id, None)
+                                data['ai_features'].pop(submission.id, None)
+                                continue
+                            
+                            if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                                await data['process_submission'](submission, context="modqueue")
+                                data['processed_modqueue_submissions'].add(submission.id)
+                    except Exception as e:
+                        print(f"[r/{subreddit_name}] Error in modqueue worker: {e}")
+            except Exception as e:
+                print(f"Error in shared modqueue worker: {e}")
+            await asyncio.sleep(15)
+    
+    async def shared_stream_worker():
+        while True:
+            try:
+                subreddits = list(subreddit_data.keys())
+                for subreddit_name in subreddits:
+                    try:
+                        data = subreddit_data[subreddit_name]
+                        subreddit = data['subreddit']
+                        
+                        async for submission in subreddit.new(limit=10):
+                            if submission.created_utc > data['current_time'] and isinstance(submission, asyncpraw.models.Submission):
+                                if submission.id in data['processed_modqueue_submissions']:
+                                    continue
 
-                batch = recent + medium + old
-                # Process in chunks of 10, pausing between chunks to respect rate limits
-                for i in range(0, len(batch), 10):
-                    await asyncio.gather(*(_verify(h, sid) for h, sid in batch[i:i+10]))
-                    if i + 10 < len(batch):
-                        await asyncio.sleep(60)
+                                print(f"[r/{subreddit_name}] Scanning new image/post: ", submission.url)
+                                
+                                if submission.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
+                                    await data['process_submission'](submission, context="stream")
+                        
+                        data['current_time'] = int(time.time())
+                    except Exception as e:
+                        print(f"[r/{subreddit_name}] Error in stream worker: {e}")
+            except Exception as e:
+                print(f"Error in shared stream worker: {e}")
+            await asyncio.sleep(20)
 
-            await asyncio.gather(*(_check_one_removal(s) for s in subs))
+    # Dispatch shared async workers
+    asyncio.create_task(shared_mod_log_monitor())
+    asyncio.create_task(shared_removal_checker())
+    asyncio.create_task(shared_modqueue_worker())
+    asyncio.create_task(shared_stream_worker())
 
-        except Exception as e:
-            print(f"Removal checker error: {e}")
-        await asyncio.sleep(60)
-
-
-# ══════════════════════════════════════════════════════════
-#  Task: new-post stream  (all subreddits concurrently)
-# ══════════════════════════════════════════════════════════
-
-async def task_stream_worker(reddit, session: aiohttp.ClientSession) -> None:
+    print("=== Multi-subreddit duplicate bot started ===")
+    print("Running with lightweight async coroutines for all subreddits")
     while True:
-        try:
-            async with subreddit_data_lock:
-                subs = list(subreddit_data.keys())
+        await asyncio.sleep(3600)  # Keep the main duplicate bot logic alive
+        
+# =========================
+# Main: initialize connections and gather loops
+# =========================
+async def main():
+    global reddit, http_session
+    
+    # Initialize a single shared Reddit instance
+    reddit = asyncpraw.Reddit(
+        client_id='jl-I3OHYH2_VZMC1feoJMQ',
+        client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
+        username='PokeLeakBot3',
+        password='testbot1',
+        user_agent='testbot_async_v1'
+    )
+    
+    # Initialize a single shared HTTP session for downloads
+    http_session = aiohttp.ClientSession()
 
-            async def _check_one_stream(sub_name: str):
-                d = subreddit_data[sub_name]
-                try:
-                    async for s in d['subreddit'].new(limit=10):
-                        if not isinstance(s, asyncpraw.models.Submission):
-                            continue
-                        if s.created_utc <= d['current_time']:
-                            continue
-                        if s.id in d['processed_modqueue_submissions']:
-                            continue
-                        if s.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                            print(f"[r/{sub_name}] Scanning new post: {s.url}")
-                            await d['process_submission'](s, context="stream")
-                    d['current_time'] = int(time.time())
-                except Exception as e:
-                    print(f"[r/{sub_name}] Stream error: {e}")
+    print("[SYSTEM] Starting all background services concurrently...")
 
-            await asyncio.gather(*(_check_one_stream(s) for s in subs))
-
-        except Exception as e:
-            print(f"Stream worker error: {e}")
-        await asyncio.sleep(20)
-
-
-# ══════════════════════════════════════════════════════════
-#  Task: duplicate-detection modqueue scan
-# ══════════════════════════════════════════════════════════
-
-async def task_modqueue_worker(reddit, session: aiohttp.ClientSession) -> None:
-    while True:
-        try:
-            async with subreddit_data_lock:
-                subs = list(subreddit_data.keys())
-
-            async def _check_one_mq(sub_name: str):
-                d = subreddit_data[sub_name]
-                try:
-                    items = sorted(
-                        [s async for s in d['subreddit'].mod.modqueue(only='submission', limit=None)],
-                        key=lambda x: x.created_utc
-                    )
-                    for s in items:
-                        if not isinstance(s, asyncpraw.models.Submission):
-                            continue
-                        if s.num_reports > 0:
-                            print(f"[r/{sub_name}] Skipping reported image: {s.url}")
-                            d['image_hashes'] = {k: v for k, v in d['image_hashes'].items() if v[0] != s.id}
-                            d['orb_descriptors'].pop(s.id, None)
-                            d['ai_features'].pop(s.id, None)
-                            continue
-                        if s.url.endswith(('jpg', 'jpeg', 'png', 'gif')):
-                            print(f"[r/{sub_name}] Scanning modqueue: {s.url}")
-                            await d['process_submission'](s, context="modqueue")
-                            d['processed_modqueue_submissions'].add(s.id)
-                except Exception as e:
-                    print(f"[r/{sub_name}] MQ dup worker error: {e}")
-
-            await asyncio.gather(*(_check_one_mq(s) for s in subs))
-
-        except Exception as e:
-            print(f"Modqueue dup worker error: {e}")
-        await asyncio.sleep(15)
-
-
-# ══════════════════════════════════════════════════════════
-#  Entry point
-# ══════════════════════════════════════════════════════════
-
-async def main() -> None:
-    global subreddit_data_lock, subreddit_configs_lock
-    # asyncio.Lock must be created inside a running event loop
-    subreddit_data_lock    = asyncio.Lock()
-    subreddit_configs_lock = asyncio.Lock()
-
-    async with make_reddit() as reddit:
-        # Limit concurrent CDN connections to avoid overwhelming Reddit's image hosts
-        connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            print("═══════════════════════════════════════════")
-            print("  Hybrid async+threaded bot started")
-            print(f"  CPU executor: {cpu_executor._max_workers} workers")
-            print("═══════════════════════════════════════════")
-            await asyncio.gather(
-                safe_run(task_sync_subreddits,        reddit, session),
-                safe_run(task_modqueue_router,         reddit),
-                safe_run(task_spoiler_monitor,         reddit),
-                safe_run(task_monitor_reported_posts,  reddit),
-                safe_run(task_mod_log_monitor,         reddit),
-                safe_run(task_removal_checker,         reddit),
-                safe_run(task_stream_worker,           reddit, session),
-                safe_run(task_modqueue_worker,         reddit, session),
-            )
-
+    try:
+        # Run all our isolated loops concurrently
+        await asyncio.gather(
+            safe_run(handle_modqueue_items),
+            safe_run(monitor_reported_posts),
+            safe_run(handle_spoiler_status),
+            safe_run(handle_user_reports_and_removal),
+            safe_run(handle_submissions_based_on_user_reports),
+            safe_run(handle_posts_based_on_removal),
+            safe_run(handle_comments_based_on_approval),
+            safe_run(run_pokemon_duplicate_bot),
+            safe_run(sync_moderated_subreddits)
+        )
+    finally:
+        # Graceful cleanup on shutdown
+        await http_session.close()
+        await reddit.close()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nShutdown requested.")
-    finally:
-        cpu_executor.shutdown(wait=False)
+        print("\n[SYSTEM] Bot shutdown initiated by user.")
