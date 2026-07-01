@@ -1,0 +1,92 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "pokeleaks-mod",
+  "scripts": {
+    "dev": "npm run build -- --watch",
+    "build": "npm run build"
+  },
+  "server": {
+    "entry": "dist/server/index.cjs"
+  },
+  "permissions": {
+    "reddit": {
+      "enable": true,
+      "scope": "moderator"
+    },
+    "redis": true,
+    "http": {
+      "enable": true,
+      "domains": ["dupes.example.com"]
+    }
+  },
+  "triggers": {
+    "onPostSubmit": "/internal/triggers/post-submit",
+    "onPostReport": "/internal/triggers/post-report",
+    "onCommentReport": "/internal/triggers/comment-report",
+    "onPostSpoilerUpdate": "/internal/triggers/post-spoiler-update",
+    "onModAction": "/internal/triggers/mod-action",
+    "onPostDelete": "/internal/triggers/post-delete",
+    "onAppInstall": "/internal/triggers/app-install",
+    "onAppUpgrade": "/internal/triggers/app-upgrade"
+  },
+  "scheduler": {
+    "tasks": {
+      "auto-approve-single-report": {
+        "endpoint": "/internal/scheduler/auto-approve"
+      }
+    }
+  },
+  "settings": {
+    "global": {
+      "serviceAuthToken": {
+        "type": "string",
+        "label": "Duplicate-service auth token (X-Auth-Token)",
+        "isSecret": true,
+        "defaultValue": ""
+      }
+    },
+    "subreddit": {
+      "duplicateServiceUrl": {
+        "type": "string",
+        "label": "Duplicate-detection service base URL (must be on the http allow-list, e.g. https://dupes.example.com)",
+        "defaultValue": ""
+      },
+      "enableDuplicateDetection": {
+        "type": "boolean",
+        "label": "Remove duplicate image posts",
+        "defaultValue": true
+      },
+      "enableReportThresholds": {
+        "type": "boolean",
+        "label": "Act on user-report thresholds",
+        "defaultValue": true
+      },
+      "reportThresholds": {
+        "type": "string",
+        "label": "Report thresholds JSON. Keys are report reasons (\"*\" = any reason). Each value: {\"postRemove\":n,\"postApprove\":n,\"commentRemove\":n,\"commentApprove\":n}. 0 disables.",
+        "validationEndpoint": "/internal/settings/validate-thresholds",
+        "defaultValue": "{\"This is spam\":{\"postRemove\":3,\"postApprove\":0,\"commentRemove\":3,\"commentApprove\":0}}"
+      },
+      "enableAutoApproveSingleReport": {
+        "type": "boolean",
+        "label": "Auto-approve posts sitting at a single report after 1 hour",
+        "defaultValue": true
+      },
+      "enableReApproveReported": {
+        "type": "boolean",
+        "label": "Re-approve already-approved posts that get reported again",
+        "defaultValue": true
+      },
+      "enableSpoilerEnforcement": {
+        "type": "boolean",
+        "label": "Re-mark posts spoiler if un-spoilered by a non-moderator",
+        "defaultValue": true
+      },
+      "backfillOnInstall": {
+        "type": "boolean",
+        "label": "Index recent posts when the app is installed/upgraded",
+        "defaultValue": true
+      }
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "pokeleaks-mod",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/server/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server/index.cjs --external:@devvit/*",
+    "dev": "npm run build -- --watch",
+    "typecheck": "tsc --noEmit",
+    "playtest": "devvit playtest",
+    "upload": "devvit upload"
+  },
+  "dependencies": {
+    "@devvit/reddit": "latest",
+    "@devvit/redis": "latest",
+    "@devvit/scheduler": "latest",
+    "@devvit/server": "latest",
+    "@devvit/settings": "latest",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "devvit": "latest",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}
