@@ -518,11 +518,11 @@ async def main():
 
     # Initialize a single shared Reddit instance
     reddit = asyncpraw.Reddit(
-        client_id='jl-I3OHYH2_VZMC1feoJMQ',
-        client_secret='TCOIQBXqIskjWEbdH9i5lvoFavAJ1A',
-        username='PokeLeakBot3',
-        password='testbot1',
-        user_agent='testbot_async_v1'
+        client_id='',
+        client_secret='',
+        username='',
+        password='',
+        user_agent=''
     )
 
     # Initialize a single shared HTTP session for downloads
